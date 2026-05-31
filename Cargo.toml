@@ -4,5 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+criterion = "0.8.2"
 memmap = "0.7.0"
 serde_json = "1.0.150"
+
+[[bench]]
+name = "ops_benchmark"
+harness = false
