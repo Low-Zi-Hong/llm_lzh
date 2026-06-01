@@ -5,12 +5,29 @@ use std::{time::UNIX_EPOCH, vec};
 use memmap::Mmap;
 use serde_json::Value;
 
+pub fn get_weight_shape(
+    weight_name: &str,
+    structure_json: &Value,
+) -> Result<Vec<usize>, String> {
+    let value = structure_json[weight_name].clone();
+
+    let shape = value["shape"]
+        .as_array()
+        .expect("cannot extract token shape")
+        .iter()
+        .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
+        .collect();
+
+    Ok(shape)
+}
+
 pub fn get_weight_matrix(
     weight_name: &str,
     structure_json: &Value,
     mmap: &Mmap,
     header_size: usize,
-) -> Result<Tensor, String> {
+    weight: &mut Tensor,
+) -> Result<(), String> {
     let value = structure_json[weight_name].clone();
     let offset: Vec<usize> = value["data_offsets"]
         .as_array()
@@ -19,37 +36,24 @@ pub fn get_weight_matrix(
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
     //let dtype = value["dtype"].as_str().expect("cannot extract dtype.");
-    let shape: Vec<usize> = value["shape"]
+    weight.shape = value["shape"]
         .as_array()
         .expect("cannot extract token shape")
         .iter()
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
 
-    let mut stride: Vec<usize> = shape
-        .iter()
-        .rev()
-        .scan(1, |state, &dim| {
-            let current_stride = *state;
-            *state *= dim;
-            Some(current_stride)
-        })
-        .collect();
-    stride.reverse();
+    weight.strides = update_stride(&weight.shape).expect("cannot get new stride");
 
     let result_raw = &mmap[8 + header_size as usize + offset[0] as usize
         ..8 + header_size as usize + offset[1] as usize];
 
-    let result = result_raw
+    weight.data = result_raw
         .chunks_exact(2)
         .map(|chunk| convert_to_f32([chunk[0], chunk[1]]).expect("cannot convert to f32."))
         .collect();
 
-    Ok(Tensor {
-        data: result,
-        shape: shape,
-        strides: stride,
-    })
+    Ok(())
 }
 
 pub fn token_embedding(token_ids: &Vec<usize>, weight_tensor: &Tensor) -> Result<Tensor, String> {
@@ -97,13 +101,22 @@ pub fn rmsnorm(
     })
 }
 
-pub fn linear_proj(input: &Tensor, weight: &Tensor, bias: &Tensor, q: &mut Tensor) -> Result<(),String> {
+pub fn linear_proj(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    q: &mut Tensor,
+) -> Result<(), String> {
     let input_shape = input.shape.clone();
     let weight_shape = weight.shape.clone();
 
     //let mut result = vec![0.0; input_shape[0] * weight_shape[0]];
 
-    assert_eq!(input_shape[0] * weight_shape[0], q.shape.iter().product::<usize>());
+    assert!(
+        input_shape[0] * weight_shape[0] <=  q.data.len()
+    );
+    //q.shape = vec![input_shape[0],weight_shape[0]];
+    //q.strides = update_stride(&q.shape).expect("cannot update stride");
 
     // 3. Perform the triple loop matrix multiplication
     for i in 0..input_shape[0] {
@@ -152,7 +165,13 @@ pub fn apply_rope(tensor: &mut Tensor, rope_theta: f32, current_pos: usize) {
     }
 }
 
-pub fn attention_score(q: &Tensor, k: &Tensor, kv_group: usize, valid_kv_len: usize,current_pos:usize) -> Result<Tensor, String> {
+pub fn attention_score(
+    q: &Tensor,
+    k: &Tensor,
+    kv_group: usize,
+    valid_kv_len: usize,
+    current_pos: usize,
+) -> Result<Tensor, String> {
     let mut s: Tensor = Tensor {
         data: vec![0.0; q.shape[1] * q.shape[0] * valid_kv_len],
         shape: vec![q.shape[1], q.shape[0], valid_kv_len],
@@ -414,8 +433,10 @@ mod tests {
             strides: vec![1],
         };
 
-        let out = linear_proj(&x, &w, &b).expect("linear_proj 计算图崩溃");
-        assert_eq!(out.shape, vec![1, 3]);
+        let mut out = Tensor::new(vec![0.0;3], vec![0]);
+
+        linear_proj(&x, &w, &b, &mut out).expect("linear_proj 计算图崩溃");
+        //assert_eq!(out.shape, vec![1, 3]);
         // out[0] = 1*0.1 + 2*0.2 + 0.1 = 0.6
         // out[1] = 1*0.3 + 2*0.4 + 0.1 = 1.2
         assert_f32_eq!(out.data[0], 0.6);
@@ -430,7 +451,7 @@ mod tests {
             strides: vec![2, 2, 1],
         };
         // 若 pos=0，theta=0，cos=1, sin=0 -> 数据不变
-        apply_rope(&mut t, 10000.0);
+        apply_rope(&mut t, 10000.0, 0);
         assert_f32_eq!(t.data[0], 1.0);
         assert_f32_eq!(t.data[1], 1.0);
     }
@@ -449,7 +470,7 @@ mod tests {
         };
 
         // 注意：内部会调用 update_stride(&s.shape)，假设其工作正常
-        let out = attention_score(&q, &k, 1).unwrap();
+        let out = attention_score(&q, &k, 1,1,0).unwrap();
         // dot product = 2.0 + 6.0 = 8.0
         // sum *= 1.0 / sqrt(2) ≈ 5.65685
         assert_f32_eq!(out.data[0], 5.65685);

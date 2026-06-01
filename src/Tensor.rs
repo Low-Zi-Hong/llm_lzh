@@ -1,4 +1,4 @@
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct Tensor {
     pub data: Vec<f32>,
     pub shape: Vec<usize>,
@@ -15,10 +15,9 @@ impl Tensor {
         }
     }
 
-    pub fn update_shape(&mut self, shape:Vec<usize>) {
+    pub fn update_shape(&mut self, shape: Vec<usize>) {
         self.strides = update_stride(&shape).expect("cannot create stride");
         self.shape = shape;
-
     }
 }
 

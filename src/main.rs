@@ -6,6 +6,10 @@ use std::{
     vec,
 }; // Built into Rust, no extra crates needed
 
+//for benchmark use
+#[cfg(feature = "bench")]
+use std::time::Instant;
+
 const TEMPERATURE: f32 = 0.7;
 const P: f32 = 0.9;
 const MAX_SEQ_LEN:usize = 128;
@@ -16,14 +20,31 @@ use tensor::{Tensor, update_stride};
 mod llm;
 use llm::{
     apply_rope, attention_score, attn_out, get_weight_matrix, linear_proj, mlp_mul, out_proj,
-    random, res_conn, rmsnorm, silu, softmax, token_embedding,
+    random, res_conn, rmsnorm, silu, softmax, token_embedding,get_weight_shape,
 };
 
 mod load;
 use load::raw_to_json;
 
+//dhat :D
+#[cfg(feature = "dhat_heap")]
+use dhat;
+
+#[cfg(feature = "dhat_heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
+    #[cfg(feature = "dhat_heap")]
+    let _profiler = dhat::Profiler::new_heap();
     println!("Hello, world!");
+
+    #[cfg(feature = "bench")]
+    let inference_start = Instant::now();
+    #[cfg(feature = "bench")]
+    let mut time_vec: Vec<std::time::Duration> = Vec::with_capacity(MAX_SEQ_LEN + 2);
+
+
     let raw_token = vec![106711, 44793, 53930, 99349, 3837, 99349, 34204, 17447, 99467, 35727, 3837, 100134, 53930, 99194, 3837];
     println!("Running llm with input token as: {:?}", raw_token);
 
@@ -77,11 +98,17 @@ fn main() {
         .expect("cannot convert num to u64") as usize;
     let kv_group = num_attention_heads / num_key_value_heads;
 
-    let embed_weight = get_weight_matrix(
+    let intermediate_size = config["intermediate_size"].as_u64().expect("cannot convert num to u64") as usize;
+
+    let embed_weight_shape = get_weight_shape("model.embed_tokens.weight",&structure_json).expect("cannot get weight shape");
+    let mut embed_weight:Tensor = Tensor::new(vec![0.0;embed_weight_shape.iter().product()], embed_weight_shape);
+
+    get_weight_matrix(
         "model.embed_tokens.weight",
         &structure_json,
         &mmap,
         header_size,
+        &mut embed_weight
     )
     .expect("cannot get embed token matrik");
 
@@ -101,6 +128,32 @@ fn main() {
     let mut k_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
     let mut v_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
 
+    let mut q_weight = Tensor::new(vec![0.0;hidden_dim * hidden_dim], vec![0]);
+    let mut q_bias = Tensor::new(vec![0.0;hidden_dim], vec![0]);
+
+    let mut k_weight = Tensor::new(vec![0.0;head_dim * head_dim], vec![0]);
+    let mut k_bias = Tensor::new(vec![0.0;head_dim], vec![0]);
+
+    let mut v_weight = Tensor::new(vec![0.0;head_dim * head_dim], vec![0]);
+    let mut v_bias = Tensor::new(vec![0.0;head_dim], vec![0]);
+
+    let mut o_proj = Tensor::new(vec![0.0;hidden_dim * hidden_dim], vec![0]);
+
+    //all weight buffer
+    let layernorm_shape = get_weight_shape("model.layers.0.input_layernorm.weight", &structure_json).expect("cannot get shape");
+    let mut layernorm_weight = Tensor::new(vec![0.0;layernorm_shape.iter().product()], layernorm_shape);
+
+    let mut post_attn_layernorm  = Tensor::new(vec![0.0;head_dim], vec![0]);
+    let mut mlp_gate = Tensor::new(vec![0.0;intermediate_size * hidden_dim], vec![0]);
+    let mut mlp_up =Tensor::new(vec![0.0;intermediate_size * hidden_dim], vec![0]);
+    let mut mlp_down = Tensor::new(vec![0.0;hidden_dim * intermediate_size], vec![0]);
+
+    #[cfg(feature = "bench")]
+    println!("⚡ [BENCH] 当前 Token 准备耗时: {:?}", inference_start.elapsed());
+    #[cfg(feature = "bench")]
+    time_vec.push(inference_start.elapsed()  - time_vec.iter().sum());
+    
+    
     //big loop :D
     loop {
         let mut x: Tensor = token_embedding(&current_token, &embed_weight).expect("fuck");
@@ -117,96 +170,80 @@ fn main() {
             k_buf.update_shape(vec![seq_length, num_key_value_heads, head_dim]);
             v_buf.update_shape(vec![seq_length,num_key_value_heads,head_dim]);
 
-
             //undergo input layernorm
-            let layernorm_weight = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.input_layernorm.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut layernorm_weight
             )
             .expect("cannot get layernorm weight.");
             let x_process = rmsnorm(&x, &layernorm_weight, hidden_dim, epsilon as f32)
                 .expect("cannot run RMSnorm");
 
             //get all weight of QKV
-            let q_weight = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.q_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut q_weight
             )
             .expect("cannot get q weight");
-            let q_bias = get_weight_matrix(
+            
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.q_proj.bias", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut q_bias,
             )
             .expect("cannot get q bias");
+            //print!("{:?}",q_bias.shape);
 
             linear_proj(&x_process, &q_weight, &q_bias, &mut q_buf).expect("cannot get q");
             //println!("q is {:?}",q_buf.shape);
 
-            let k_weight = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.k_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut k_weight
             )
             .expect("cannot get k weight");
-            let k_bias = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.k_proj.bias", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut k_bias
             )
             .expect("cannot get k weight");
 
             linear_proj(&x_process, &k_weight, &k_bias, &mut k_buf).expect("cannot get k");
             //println!("k is {:?}",&k_buf.shape);
 
-            let v_weight = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.v_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut v_weight
             )
             .expect("cannot get v weight");
-            let v_bias = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.v_proj.bias", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut v_bias
             )
             .expect("cannot get v weight");
 
             linear_proj(&x_process, &v_weight, &v_bias, &mut v_buf).expect("cannot get v");
             //println!("v is {:?}",&v_buf.shape);
-
-           // let mut ori_shape = q_buf.shape.clone();
-           // q_buf.shape = vec![
-           //     ori_shape[0],
-           //     num_attention_heads,
-           //     ori_shape[1] / num_attention_heads,
-           // ];
-           // q_buf.strides = update_stride(&q_buf.shape).expect("cannot update stride");
-//
-           // ori_shape = k_buf.shape.clone();
-           // k_buf.shape = vec![
-           //     ori_shape[0],
-           //     num_key_value_heads,
-           //     ori_shape[1] / num_key_value_heads,
-           // ];
-           // k_buf.strides = update_stride(&k_buf.shape).expect("cannot update stride");
-//
-           // ori_shape = v_buf.shape.clone();
-           // v_buf.shape = vec![
-           //     ori_shape[0],
-           //     num_key_value_heads,
-           //     ori_shape[1] / num_key_value_heads,
-           // ];
-           // v_buf.strides = update_stride(&v_buf.shape).expect("cannot update stride");
 
             //GO ROPE!!!!!!!!!!
             let rope_theta = config["rope_theta"]
@@ -245,11 +282,12 @@ fn main() {
             attn.strides = update_stride(&attn.shape).expect("cannot update stride");
 
             //output projection
-            let o_proj = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.self_attn.o_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut o_proj,
             )
             .expect("cannot get o weight");
 
@@ -261,32 +299,36 @@ fn main() {
             //print!("{:?}",&x);
 
             //MLP
-            let post_attn_layernorm = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.post_attention_layernorm.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut post_attn_layernorm,
             )
             .expect("cannot get  post attention layer norm weight");
-            let mlp_gate = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.mlp.gate_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut mlp_gate,
             )
             .expect("cannot get mlp gate proj");
-            let mlp_up = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.mlp.up_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut mlp_up
             )
             .expect("cannot get ml up proj");
-            let mlp_down = get_weight_matrix(
+            get_weight_matrix(
                 &format!("model.layers.{}.mlp.down_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
                 header_size,
+                &mut mlp_down
             )
             .expect("cannot get mlp down proj");
 
@@ -311,9 +353,10 @@ fn main() {
             strides: update_stride(&vec![1, hidden_dim]).expect("cannot get stride"),
         };
 
-        let lm_head_weight =
-            get_weight_matrix("model.norm.weight", &structure_json, &mmap, header_size)
-                .expect("cannot get norm weight");
+        let mut lm_head_weight = Tensor::new(vec![0.0;hidden_dim], vec![0]);
+
+        get_weight_matrix("model.norm.weight", &structure_json, &mmap, header_size, &mut lm_head_weight)
+            .expect("cannot get norm weight");
         let last_norm =
             rmsnorm(&last_token, &lm_head_weight, hidden_dim, epsilon as f32).expect("cannot norm");
 
@@ -392,9 +435,21 @@ fn main() {
         current_pos += seq_length;
         current_token = vec![next_token_id];
 
-        if next_token_id == 151643 || next_token_id == 151645 {
+        if next_token_id == 151643 || next_token_id == 151645 || current_pos >= 50{
             break;
         }
+
+        
+
+
+        //bench
+        #[cfg(feature = "bench")]
+        println!("⚡ [BENCH] 当前 Token 生成耗时: {:?}", inference_start.elapsed());
+        #[cfg(feature = "bench")]
+        time_vec.push(inference_start.elapsed() - time_vec.iter().sum());
+        #[cfg(feature = "bench")]
+        println!("{:?}",time_vec);
+
     }
 
     //print!("{:?}", x);
