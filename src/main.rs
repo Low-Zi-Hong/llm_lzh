@@ -12,7 +12,7 @@ use std::time::Instant;
 
 const TEMPERATURE: f32 = 0.7;
 const P: f32 = 0.9;
-const MAX_SEQ_LEN:usize = 128;
+const MAX_SEQ_LEN:usize = 2048;
 
 mod tensor;
 use tensor::{Tensor, update_stride};
@@ -45,7 +45,7 @@ fn main() {
     let mut time_vec: Vec<std::time::Duration> = Vec::with_capacity(MAX_SEQ_LEN + 2);
 
 
-    let raw_token = vec![106711, 44793, 53930, 99349, 3837, 99349, 34204, 17447, 99467, 35727, 3837, 100134, 53930, 99194, 3837];
+    let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
     println!("Running llm with input token as: {:?}", raw_token);
 
     //process token
@@ -54,12 +54,12 @@ fn main() {
     let mut current_pos:usize = 0;
 
     //load config.json
-    let config_path: String = "config.json".to_string();
+    let config_path: String = "../model_qwen/config.json".to_string();
     let config_raw = fs::read_to_string(config_path).expect("cannot read config file.");
     let config: Value = serde_json::from_str(&config_raw).expect("cannot parse config file");
 
     //model path
-    let file_path = "model.safetensors";
+    let file_path = "../model_qwen/model.safetensors";
 
     //open the file and use mmap to map to memory
     let file = File::open(file_path).unwrap();
@@ -435,7 +435,7 @@ fn main() {
         current_pos += seq_length;
         current_token = vec![next_token_id];
 
-        if next_token_id == 151643 || next_token_id == 151645 || current_pos >= 50{
+        if next_token_id == 151643 || next_token_id == 151645 {
             break;
         }
 
