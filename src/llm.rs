@@ -1,5 +1,4 @@
-use crate::load::convert_to_f32;
-use crate::tensor::{Tensor, update_stride};
+use crate::tensor::{Tensor,WeightTensor,bytes_to_u16_slice,bf16_u16_to_f32, update_stride};
 use std::{time::UNIX_EPOCH, vec};
 
 use memmap::Mmap;
@@ -21,14 +20,14 @@ pub fn get_weight_shape(
     Ok(shape)
 }
 
-pub fn get_weight_matrix(
+pub fn get_weight_matrix<'a>(
     weight_name: &str,
     structure_json: &Value,
-    mmap: &Mmap,
+    mmap: &'a Mmap,
     header_size: usize,
-    weight: &mut Tensor,
-) -> Result<(), String> {
-    let value = structure_json[weight_name].clone();
+) -> Result<WeightTensor<'a>, String> {
+
+    let value = &structure_json[weight_name];
     let offset: Vec<usize> = value["data_offsets"]
         .as_array()
         .expect("cannot extract token offset")
@@ -36,48 +35,41 @@ pub fn get_weight_matrix(
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
     //let dtype = value["dtype"].as_str().expect("cannot extract dtype.");
-    weight.shape = value["shape"]
+    let shape = value["shape"]
         .as_array()
         .expect("cannot extract token shape")
         .iter()
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
 
-    weight.strides = update_stride(&weight.shape).expect("cannot get new stride");
-
     let result_raw = &mmap[8 + header_size as usize + offset[0] as usize
         ..8 + header_size as usize + offset[1] as usize];
 
-    weight.data = result_raw
-        .chunks_exact(2)
-        .map(|chunk| convert_to_f32([chunk[0], chunk[1]]).expect("cannot convert to f32."))
-        .collect();
+    let weight = WeightTensor::new(bytes_to_u16_slice(result_raw).expect("cannot convert to &[f32]"), shape);
 
-    Ok(())
+    Ok(weight)
 }
 
-pub fn token_embedding(token_ids: &Vec<usize>, weight_tensor: &Tensor) -> Result<Tensor, String> {
+pub fn token_embedding(token_ids: &Vec<usize>, weight_tensor: &WeightTensor, x:&mut Tensor) -> Result<(), String> {
     let hidden_dim = weight_tensor.shape[1];
 
-    let result = token_ids
+    x.data = token_ids
         .iter()
         .flat_map(|&id| {
             weight_tensor.data[(id * hidden_dim)..((id + 1) * hidden_dim)]
                 .iter()
-                .copied()
+                .map(|x| bf16_u16_to_f32(*x))
         })
         .collect();
 
-    Ok(Tensor {
-        data: result,
-        shape: vec![token_ids.len(), hidden_dim],
-        strides: vec![1 * hidden_dim, 1],
-    })
+    x.update_shape(vec![token_ids.len(), hidden_dim]);
+
+    Ok(())
 }
 
 pub fn rmsnorm(
     input: &Tensor,
-    weight: &Tensor,
+    weight: &WeightTensor,
     hidden_dim: usize,
     epsilon: f32,
 ) -> Result<Tensor, String> {
@@ -90,7 +82,7 @@ pub fn rmsnorm(
             chunk
                 .iter()
                 .zip(weight.data.iter())
-                .map(move |(&x, &w)| (x / denominator) * w)
+                .map(move |(&x, &w)| (x / denominator) * bf16_u16_to_f32(w))
         })
         .collect();
 
@@ -103,8 +95,8 @@ pub fn rmsnorm(
 
 pub fn linear_proj(
     input: &Tensor,
-    weight: &Tensor,
-    bias: &Tensor,
+    weight: &WeightTensor,
+    bias: &WeightTensor,
     q: &mut Tensor,
 ) -> Result<(), String> {
     let input_shape = input.shape.clone();
@@ -127,11 +119,11 @@ pub fn linear_proj(
                 let idx_input = i * input_shape[1] + k;
                 let idx_weight = j * weight_shape[1] + k;
 
-                sum += input.data[idx_input] * weight.data[idx_weight];
+                sum += input.data[idx_input] * bf16_u16_to_f32(weight.data[idx_weight]);
             }
             // Store the final dot product result
             let out_idx = i * q.strides[0] + j;
-            q.data[out_idx] = sum + bias.data[j];
+            q.data[out_idx] = sum + bf16_u16_to_f32(bias.data[j]);
         }
     }
 
@@ -253,18 +245,15 @@ pub fn softmax(t: &mut Tensor) {
     }
 }
 
-pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize) -> Result<Tensor, String> {
-    let mut o: Tensor = Tensor {
-        data: vec![],
-        shape: vec![s.shape[1], s.shape[0], v.shape[2]],
-        strides: vec![],
-    };
-    o.strides = update_stride(&o.shape).expect("cannot generate stride");
-    o.data = vec![0.0 as f32; o.shape[0] * o.shape[1] * o.shape[2]];
+pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize, attn: &mut Tensor) -> Result<(), String> {
 
-    for pos_q in 0..o.shape[0] {
-        for h in 0..o.shape[1] {
-            for d in 0..o.shape[2] {
+    attn.update_shape(vec![s.shape[1], s.shape[0], v.shape[2]]);
+
+    assert!(attn.data.len() >= attn.shape.iter().product(), "attn shape wrong");
+
+    for pos_q in 0..attn.shape[0] {
+        for h in 0..attn.shape[1] {
+            for d in 0..attn.shape[2] {
                 let mut sum = 0.0 as f32;
                 for pos_k in 0..s.shape[2] {
                     let idx_s = h * s.strides[0] + pos_q * s.strides[1] + pos_k * s.strides[2];
@@ -272,35 +261,34 @@ pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize) -> Result<Tensor, Strin
                         pos_k * v.strides[0] + (h / kv_group) * v.strides[1] + d * v.strides[2];
                     sum += s.data[idx_s] * v.data[idx_v];
                 }
-                let idx = pos_q * o.strides[0] + h * o.strides[1] + d * o.strides[2];
-                o.data[idx] = sum;
+                let idx = pos_q * attn.strides[0] + h * attn.strides[1] + d * attn.strides[2];
+                attn.data[idx] = sum;
             }
         }
     }
 
-    Ok(o)
+    Ok(())
 }
 
-pub fn out_proj(attn: &Tensor, o: &Tensor) -> Result<Tensor, String> {
-    let mut atten_fn: Tensor = Tensor {
-        data: vec![],
-        shape: vec![attn.shape[0], attn.shape[1]],
-        strides: vec![],
-    };
-    atten_fn.strides = update_stride(&atten_fn.shape).expect("cannot get stride");
-    atten_fn.data = vec![0.0 as f32; atten_fn.shape[0] * atten_fn.shape[1]];
+pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+    
+    
+    atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
+
+    assert!(atten_fn.data.len() >= atten_fn.shape.iter().product(), "attn shape wrong");
+
 
     for i in 0..attn.shape[0] {
         for j in 0..o.shape[0] {
             let mut sum = 0.0f32;
             for k in 0..attn.shape[1] {
-                sum += attn.data[i * attn.strides[0] + k] * o.data[j * o.strides[0] + k];
+                sum += attn.data[i * attn.strides[0] + k] * bf16_u16_to_f32(o.data[j * o.strides[0] + k]);
             }
             atten_fn.data[i * atten_fn.strides[0] + j] = sum;
         }
     }
 
-    Ok(atten_fn)
+    Ok(())
 }
 
 pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
@@ -311,7 +299,7 @@ pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
         .for_each(|(a, b)| *a += *b);
 }
 
-pub fn mlp_mul(x: &Tensor, weight: &Tensor) -> Result<Tensor, String> {
+pub fn mlp_mul(x: &Tensor, weight: &WeightTensor) -> Result<Tensor, String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
     let mut output: Tensor = Tensor {
         data: vec![],
@@ -328,7 +316,7 @@ pub fn mlp_mul(x: &Tensor, weight: &Tensor) -> Result<Tensor, String> {
                 let x_val = x.data[i * x.strides[0] + j * x.strides[1]];
                 let w_val = weight.data[k * weight.strides[0] + j * weight.strides[1]];
 
-                sum += x_val * w_val;
+                sum += x_val * bf16_u16_to_f32(w_val);
             }
 
             output.data[i * output.strides[0] + k * output.strides[1]] = sum;
@@ -367,6 +355,10 @@ mod tests {
     use crate::tensor::Tensor;
     use std::vec;
 
+    fn mock_f32_to_bf16(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+    }
+
     // 物理级探针：处理 f32 浮点数计算时的微小精度误差
     macro_rules! assert_f32_eq {
         ($a:expr, $b:expr) => {
@@ -382,13 +374,16 @@ mod tests {
     #[test]
     fn test_token_embedding() {
         let token_ids = vec![1]; // 选取词表第 2 个 token
-        let weight_tensor = Tensor {
-            data: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        let raw_f32 = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let weight_tensor = WeightTensor {
+            data: &w_data,
             shape: vec![2, 3], // 2个token，hidden_dim=3
             strides: vec![3, 1],
         };
 
-        let out = token_embedding(&token_ids, &weight_tensor).expect("embedding 提取崩溃");
+        let mut out = Tensor::new(vec![0.0;2*3], vec![0]);
+        token_embedding(&token_ids, &weight_tensor,&mut out).expect("embedding 提取崩溃");
         assert_eq!(out.shape, vec![1, 3]);
         assert_f32_eq!(out.data[0], 0.4);
         assert_f32_eq!(out.data[1], 0.5);
@@ -402,8 +397,10 @@ mod tests {
             shape: vec![2],
             strides: vec![1],
         };
-        let weight = Tensor {
-            data: vec![1.0, 2.0],
+        let raw_f32 =  vec![1.0, 2.0];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let weight = WeightTensor {
+            data: &w_data,
             shape: vec![2],
             strides: vec![1],
         };
@@ -422,13 +419,17 @@ mod tests {
             shape: vec![1, 2],
             strides: vec![2, 1],
         };
-        let w = Tensor {
-            data: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], // [3, 2]
+        let raw_f32 = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let w = WeightTensor {
+            data: &w_data,
             shape: vec![3, 2],
             strides: vec![2, 1],
         };
-        let b = Tensor {
-            data: vec![0.1, 0.1, 0.1], // bias
+        let raw_f32 =  vec![0.1, 0.1, 0.1];
+        let b_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let b = WeightTensor {
+            data: &b_data, // bias
             shape: vec![3],
             strides: vec![1],
         };
@@ -504,7 +505,8 @@ mod tests {
         };
         // out[d=0] = 0.5*1.0 + 0.5*3.0 = 2.0
         // out[d=1] = 0.5*2.0 + 0.5*4.0 = 3.0
-        let out = attn_out(&s, &v, 1).unwrap();
+        let mut out =Tensor::new(vec![0.0;100], vec![0]);
+        attn_out(&s, &v, 1,&mut out).unwrap();
         assert_f32_eq!(out.data[0], 2.0);
         assert_f32_eq!(out.data[1], 3.0);
     }
@@ -525,19 +527,22 @@ mod tests {
 
         // 3. 构建 o_proj 权重张量 [out_dim, hidden_dim]
         // 假设我们要把它投射回一个 dim=2 的空间，所以 shape 是 [2, 4]
-        let o_proj = Tensor {
-            data: vec![
+        let raw_f32 =  vec![
                 0.1, 0.2, 0.3, 0.4, // 对应第 1 个输出特征
                 0.5, 0.6, 0.7, 0.8, // 对应第 2 个输出特征
                 0.1, 0.2, 0.3, 0.4, // 对应第 3 个输出特征
                 0.5, 0.6, 0.7, 0.8, // 对应第 4 个输出特征
-            ],
+            ];
+        let o_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let o_proj = WeightTensor {
+            data: &o_data,
             shape: vec![4, 4],
             strides: vec![4, 1], // 2D 步长
         };
 
         // 4. 送入你的原始 out_proj
-        let out = out_proj(&attn, &o_proj).expect("out_proj 计算图崩溃");
+        let mut out =Tensor::new(vec![0.0;100], vec![0]);
+        out_proj(&attn, &o_proj, &mut out).expect("out_proj 计算图崩溃");
 
         // 5. 物理期望校验
         // out[0] = 1*0.1 + 2*0.2 + 3*0.3 + 4*0.4 = 0.1 + 0.4 + 0.9 + 1.6 = 3.0
@@ -571,8 +576,10 @@ mod tests {
             shape: vec![1, 2],
             strides: vec![2, 1],
         };
-        let w = Tensor {
-            data: vec![2.0, 3.0, 4.0, 5.0], // shape [2, 2]
+        let raw_f32 = vec![2.0, 3.0, 4.0, 5.0];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+        let w = WeightTensor {
+            data: &w_data, // shape [2, 2]
             shape: vec![2, 2],
             strides: vec![2, 1],
         };

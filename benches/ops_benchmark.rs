@@ -3,8 +3,12 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use llm_lzh::{
     llm::{apply_rope, linear_proj, mlp_mul, rmsnorm, silu, attention_score,res_conn, attn_out, softmax},
-    tensor::Tensor,
+    tensor::{Tensor,WeightTensor},
 };
+
+fn mock_f32_to_bf16(val: f32) -> u16 {
+(val.to_bits() >> 16) as u16
+}
 
 //[Generate by Gemini]
 fn bench_core_ops(c: &mut Criterion) {
@@ -14,7 +18,9 @@ fn bench_core_ops(c: &mut Criterion) {
     // 1. RMSNorm Bench (1x896 向量)
     // ==========================================
     let input_1d = Tensor::new(vec![0.5; 896], vec![1, 896]);
-    let weight_1d = Tensor::new(vec![1.0; 896], vec![896]);
+    let raw_f32 = vec![1.0; 896];
+    let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let weight_1d = WeightTensor::new(&w_data, vec![896]);
 
     group.bench_function("rmsnorm_896", |b| {
         b.iter(|| {
@@ -55,7 +61,9 @@ fn bench_core_ops(c: &mut Criterion) {
     // 输入 [1, 896] x 权重 [896, 3584] (目前带 vec![] 内存分配)
     // ==========================================
     let mlp_x = Tensor::new(vec![0.5; 896], vec![1, 896]);
-    let mlp_w = Tensor::new(vec![0.1; 896 * 3584], vec![896, 3584]);
+    let raw_f32 = vec![0.1; 896 * 3584];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let mlp_w = WeightTensor::new(&w_data, vec![896, 3584]);
 
     group.bench_function("mlp_mul_896x3584 (with alloc)", |b| {
         b.iter(|| {
@@ -70,8 +78,12 @@ fn bench_core_ops(c: &mut Criterion) {
     // 用来和上面带 alloc 的 mlp_mul 形成惨烈对比！
     // ==========================================
     let lin_x = Tensor::new(vec![0.5; 896], vec![1, 896]);
-    let lin_w = Tensor::new(vec![0.1; 896 * 896], vec![896, 896]);
-    let lin_bias = Tensor::new(vec![0.0; 896], vec![896]); // 如果你的签名需要 bias
+    let raw_f32 = vec![0.1; 896 * 896];
+        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let lin_w = WeightTensor::new(&w_data, vec![896, 896]);
+    let raw_f32 = vec![0.0; 896];
+        let b_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let lin_bias = WeightTensor::new(&b_data, vec![896]); // 如果你的签名需要 bias
     let mut lin_out = Tensor::new(vec![0.0; 896], vec![1, 896]);
 
     group.bench_function("linear_proj_896x896 (in-place)", |b| {
