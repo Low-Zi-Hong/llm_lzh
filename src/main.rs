@@ -99,7 +99,8 @@ fn main() {
         .expect("cannot convert num to u64") as usize;
     let kv_group = num_attention_heads / num_key_value_heads;
 
-    //let intermediate_size = config["intermediate_size"].as_u64().expect("cannot convert num to u64") as usize;
+    let intermediate_size = config["intermediate_size"].as_u64().expect("cannot convert num to u64") as usize;
+    let vocab_size = config["vocab_size"].as_u64().expect("cannot get vocab") as usize;
 
     //let embed_weight_shape = get_weight_shape("model.embed_tokens.weight",&structure_json).expect("cannot get weight shape");
     //let mut embed_weight:Tensor = Tensor::new(vec![0.0;embed_weight_shape.iter().product()], embed_weight_shape);
@@ -128,9 +129,16 @@ fn main() {
     let mut k_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
     let mut v_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
 
+    let mut s = Tensor::new(vec![0.0;num_attention_heads * current_token.len() * MAX_SEQ_LEN], vec![num_attention_heads,current_token.len(),MAX_SEQ_LEN]);
+
      let mut attn = Tensor::new(vec![0.0;MAX_SEQ_LEN * hidden_dim], vec![MAX_SEQ_LEN , hidden_dim]);
      let mut attn_final = Tensor::new(vec![0.0;MAX_SEQ_LEN * hidden_dim], vec![MAX_SEQ_LEN , hidden_dim]);
 
+    let mut gate = Tensor::new(vec![0.0;current_token.len() * intermediate_size], vec![current_token.len(), intermediate_size]);
+    let mut up =Tensor::new(vec![0.0;current_token.len() * intermediate_size], vec![current_token.len(), intermediate_size]);
+    let mut ffn_x = Tensor::new(vec![0.0;current_token.len() * hidden_dim],vec![current_token.len(),hidden_dim]);
+
+    let mut logits = Tensor::new(vec![0.0;vocab_size], vec![vocab_size]);
 
 
     #[cfg(feature = "bench")]
@@ -248,11 +256,11 @@ fn main() {
             } else { 
                 current_pos     // decode：当前 token 的绝对位置
             };
-            let mut s = attention_score(&q_buf, &k_cache[layer], kv_group,valid_kv_len,attn_start_pos).expect("cannot get score");   // Need new Tensor
-
+            attention_score(&q_buf, &k_cache[layer], kv_group,valid_kv_len,attn_start_pos, &mut s).expect("cannot get score");   // Need new Tensor
+            
+            //print!("{:?}", &s.shape);
             //softmax
             softmax(&mut s);
-            //print!("{:?}", &s.data[0..s.shape[1] * s.shape[0]]);
 
             //cal O times value
             
@@ -310,11 +318,12 @@ fn main() {
             //post layer norm
             let post_afternorm = rmsnorm(&x, &post_attn_layernorm, hidden_dim, epsilon as f32)
                 .expect("cannot perform layernorm");
-            let mut gate = mlp_mul(&post_afternorm, &mlp_gate).expect("cannot mul gate");
-            let up = mlp_mul(&post_afternorm, &mlp_up).expect("cannot mul up");     // here need new Tensor
+            mlp_mul(&post_afternorm, &mlp_gate, &mut gate).expect("cannot mul gate");
+            mlp_mul(&post_afternorm, &mlp_up, &mut up).expect("cannot mul up");     // here need new Tensor
             silu(&mut gate, &up);
 
-            let ffn_x = mlp_mul(&gate, &mlp_down).expect("cannot perform mlp_mul");     // here need new Tensor
+            mlp_mul(&gate, &mlp_down, &mut ffn_x).expect("cannot perform mlp_mul");     // here need new Tensor
+
             res_conn(&mut x, &ffn_x);
 
         }
@@ -333,7 +342,7 @@ fn main() {
         let last_norm =
             rmsnorm(&last_token, &lm_head_weight, hidden_dim, epsilon as f32).expect("cannot norm");
 
-        let mut logits = mlp_mul(&last_norm, &embed_weight).expect("lets goooooo!");
+        mlp_mul(&last_norm, &embed_weight, &mut logits).expect("lets goooooo!");
 
         logits.data.iter_mut().for_each(|x| *x = *x / TEMPERATURE);
         //print!("{:?}:{:?}" ,logits.shape,logits.strides);

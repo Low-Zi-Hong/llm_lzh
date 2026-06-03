@@ -163,15 +163,12 @@ pub fn attention_score(
     kv_group: usize,
     valid_kv_len: usize,
     current_pos: usize,
-) -> Result<Tensor, String> {
-    let mut s: Tensor = Tensor {
-        data: vec![0.0; q.shape[1] * q.shape[0] * valid_kv_len],
-        shape: vec![q.shape[1], q.shape[0], valid_kv_len],
-        strides: vec![],
-    };
+    s: &mut Tensor
+) -> Result<(), String> {
 
-    //update stride
-    s.strides = update_stride(&s.shape).expect("cannot generate stride for S");
+    s.update_shape(vec![q.shape[1], q.shape[0], valid_kv_len]);
+
+
     //print!("S shape: {:?} S stride:  {:?} S data size: {:?}",&s.shape, &s.strides, &s.data.len());
     for h in 0..s.shape[0] {
         //iter through head
@@ -179,6 +176,7 @@ pub fn attention_score(
             for pos_k in 0..s.shape[2] {
                 let idx = h * s.strides[0] + pos_q * s.strides[1] + pos_k * s.strides[2] as usize;
                 let abs_pos_q = pos_q + (current_pos - (q.shape[0] - 1));
+                s.data[idx] = 0.0;
                 if abs_pos_q >= pos_k {
                     //determine use which K head
                     let k_h = h / kv_group as usize;
@@ -205,7 +203,7 @@ pub fn attention_score(
         }
     }
 
-    Ok(s)
+    Ok(())
 }
 
 pub fn softmax(t: &mut Tensor) {
@@ -293,37 +291,38 @@ pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Resul
 
 pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
     //print!("{:?}",x.shape);
-    x.data
+    let valid_data :usize = x.shape.iter().product();
+    x.data[..valid_data]
         .iter_mut()
         .zip(attn_final.data.iter())
         .for_each(|(a, b)| *a += *b);
 }
 
-pub fn mlp_mul(x: &Tensor, weight: &WeightTensor) -> Result<Tensor, String> {
+pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
-    let mut output: Tensor = Tensor {
-        data: vec![],
-        shape: vec![x.shape[0], weight.shape[0]],
-        strides: vec![],
-    };
-    output.strides = update_stride(&output.shape).expect("cannot upoadte stride");
-    output.data = vec![0.0; output.shape[0] * output.shape[1]];
-
+    output.update_shape(vec![x.shape[0], weight.shape[0]]);
+    let s1 = x.strides[0];
+    let s2 = x.strides[1];
+    let w1 = weight.strides[0];
+    let w2 = weight.strides[1];
+    let o1 = output.strides[0];
+    let o2 = output.strides[1];
     for i in 0..x.shape[0] {
         for k in 0..weight.shape[0] {
             let mut sum = 0.0;
             for j in 0..x.shape[1] {
-                let x_val = x.data[i * x.strides[0] + j * x.strides[1]];
-                let w_val = weight.data[k * weight.strides[0] + j * weight.strides[1]];
 
-                sum += x_val * bf16_u16_to_f32(w_val);
+                let x_val = x.data[i * s1 + j * s2];
+
+                let w_val = bf16_u16_to_f32(weight.data[(k * w1) + (j * w2)]);
+
+                sum += x_val * w_val;
             }
-
-            output.data[i * output.strides[0] + k * output.strides[1]] = sum;
+            output.data[i * o1 + k * o2] = sum;
         }
     }
 
-    Ok(output)
+    Ok(())
 }
 
 pub fn silu(weight: &mut Tensor, up: &Tensor) {
@@ -470,8 +469,10 @@ mod tests {
             strides: vec![2, 2, 1],
         };
 
+        let mut out = Tensor::new(vec![0.0;100], vec![0]);
+
         // 注意：内部会调用 update_stride(&s.shape)，假设其工作正常
-        let out = attention_score(&q, &k, 1,1,0).unwrap();
+        attention_score(&q, &k, 1,1,0,&mut out).unwrap();
         // dot product = 2.0 + 6.0 = 8.0
         // sum *= 1.0 / sqrt(2) ≈ 5.65685
         assert_f32_eq!(out.data[0], 5.65685);
@@ -583,9 +584,10 @@ mod tests {
             shape: vec![2, 2],
             strides: vec![2, 1],
         };
+        let mut out = Tensor::new(vec![0.0;10000], vec![0]);
         // out[0,0] = x[0,0]*w[0,0] + x[0,1]*w[0,1] = 1*2 + 2*3 = 8.0
         // out[0,1] = x[0,0]*w[1,0] + x[0,1]*w[1,1] = 1*4 + 2*5 = 14.0
-        let out = mlp_mul(&x, &w).unwrap();
+        mlp_mul(&x, &w,&mut out).unwrap();
         assert_f32_eq!(out.data[0], 8.0);
         assert_f32_eq!(out.data[1], 14.0);
     }
