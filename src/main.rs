@@ -1,7 +1,6 @@
 use memmap::Mmap;
 use serde_json::Value;
 use std::io::{self, Write};
-use std::usize::MAX;
 use std::{
     fs::{self, File},
     vec,
@@ -13,15 +12,15 @@ use std::time::Instant;
 
 const TEMPERATURE: f32 = 0.7;
 const P: f32 = 0.9;
-const MAX_SEQ_LEN:usize = 2048;
+const MAX_SEQ_LEN: usize = 2048;
 
 mod tensor;
 use tensor::{Tensor, update_stride};
 
 mod llm;
 use llm::{
-    apply_rope, attention_score, attn_out, get_weight_matrix, linear_proj, mlp_mul, out_proj,
-    random, res_conn, rmsnorm, silu, softmax, token_embedding,get_weight_shape,
+    apply_rope, attention_score, attn_out, get_weight_matrix, get_weight_shape, linear_proj,
+    mlp_mul, out_proj, random, res_conn, rmsnorm, silu, softmax, token_embedding,
 };
 
 mod load;
@@ -35,6 +34,11 @@ use dhat;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+#[cfg(feature = "bench")]
+mod bench;
+#[cfg(feature = "bench")]
+use bench::{GlobalMonitor,FnIndex};
+
 fn main() {
     #[cfg(feature = "dhat_heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -43,16 +47,33 @@ fn main() {
     #[cfg(feature = "bench")]
     let inference_start = Instant::now();
     #[cfg(feature = "bench")]
+    let mut last_time: std::time::Duration = std::time::Duration::ZERO;
+    #[cfg(feature = "bench")]
     let mut time_vec: Vec<std::time::Duration> = Vec::with_capacity(MAX_SEQ_LEN + 2);
+
+    #[cfg(feature = "bench")]
+    macro_rules! call_indicator {
+        () => {
+            #[cfg(feature = "bench")]
+            {
+                let total_elapse = inference_start.elapsed();
+                let current_duration = total_elapse - last_time;
+                time_vec.push(current_duration);
+                last_time += current_duration;
+            }
+        };
+    }
+    #[cfg(feature = "bench")]
+    let mut monitor = GlobalMonitor::new();
 
 
     let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
     println!("Running llm with input token as: {:?}", raw_token);
 
     //process token
-    let mut whole_token_list:Vec<usize> = raw_token.clone();
-    let mut current_token:Vec<usize> = raw_token.clone();
-    let mut current_pos:usize = 0;
+    let mut whole_token_list: Vec<usize> = raw_token.clone();
+    let mut current_token: Vec<usize> = raw_token.clone();
+    let mut current_pos: usize = 0;
 
     //load config.json
     let config_path: String = "config.json".to_string();
@@ -78,7 +99,6 @@ fn main() {
     let json_raw = &mmap[8..8 + header_size];
     let structure_json: Value = raw_to_json(json_raw).expect("cannot run function raw_to_json");
 
-    
     let layer_count = config["num_hidden_layers"]
         .as_f64()
         .expect("cannot get layer num") as usize;
@@ -90,8 +110,8 @@ fn main() {
     let epsilon = config["rms_norm_eps"].as_f64().expect("cannot get epsilon");
 
     let num_attention_heads = config["num_attention_heads"]
-    .as_u64()
-    .expect("cannot convert num to u64") as usize;
+        .as_u64()
+        .expect("cannot convert num to u64") as usize;
 
     //let num_hidden_layers = config["num_hidden_layers"].as_u64().expect("cannot convert num to u64") as usize;
     let num_key_value_heads = config["num_key_value_heads"]
@@ -99,7 +119,9 @@ fn main() {
         .expect("cannot convert num to u64") as usize;
     let kv_group = num_attention_heads / num_key_value_heads;
 
-    let intermediate_size = config["intermediate_size"].as_u64().expect("cannot convert num to u64") as usize;
+    let intermediate_size = config["intermediate_size"]
+        .as_u64()
+        .expect("cannot convert num to u64") as usize;
     let vocab_size = config["vocab_size"].as_u64().expect("cannot get vocab") as usize;
 
     //let embed_weight_shape = get_weight_shape("model.embed_tokens.weight",&structure_json).expect("cannot get weight shape");
@@ -117,52 +139,93 @@ fn main() {
     //let kv_dim = hidden_dim / kv_group;
 
     //cache
-    let mut k_cache:Vec<Tensor> = Vec::with_capacity(layer_count);
-    let mut v_cache:Vec<Tensor> = Vec::with_capacity(layer_count);
+    let mut k_cache: Vec<Tensor> = Vec::with_capacity(layer_count);
+    let mut v_cache: Vec<Tensor> = Vec::with_capacity(layer_count);
 
-    for _ in 0..layer_count{
-        k_cache.push(Tensor::new(vec![0.0;MAX_SEQ_LEN*num_key_value_heads*head_dim], vec![MAX_SEQ_LEN,num_key_value_heads,head_dim]));
-        v_cache.push(Tensor::new(vec![0.0;MAX_SEQ_LEN*num_key_value_heads*head_dim], vec![MAX_SEQ_LEN,num_key_value_heads,head_dim]));
+    for _ in 0..layer_count {
+        k_cache.push(Tensor::new(
+            vec![0.0; MAX_SEQ_LEN * num_key_value_heads * head_dim],
+            vec![MAX_SEQ_LEN, num_key_value_heads, head_dim],
+        ));
+        v_cache.push(Tensor::new(
+            vec![0.0; MAX_SEQ_LEN * num_key_value_heads * head_dim],
+            vec![MAX_SEQ_LEN, num_key_value_heads, head_dim],
+        ));
     }
 
-    let mut q_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_attention_heads * hidden_dim], vec![MAX_SEQ_LEN,num_attention_heads,head_dim]);
-    let mut k_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
-    let mut v_buf = Tensor::new(vec![0.0;MAX_SEQ_LEN * num_key_value_heads * hidden_dim], vec![MAX_SEQ_LEN, num_key_value_heads, head_dim]);
+    let mut q_buf = Tensor::new(
+        vec![0.0; MAX_SEQ_LEN * num_attention_heads * hidden_dim],
+        vec![MAX_SEQ_LEN, num_attention_heads, head_dim],
+    );
+    let mut k_buf = Tensor::new(
+        vec![0.0; MAX_SEQ_LEN * num_key_value_heads * hidden_dim],
+        vec![MAX_SEQ_LEN, num_key_value_heads, head_dim],
+    );
+    let mut v_buf = Tensor::new(
+        vec![0.0; MAX_SEQ_LEN * num_key_value_heads * hidden_dim],
+        vec![MAX_SEQ_LEN, num_key_value_heads, head_dim],
+    );
 
-    let mut s = Tensor::new(vec![0.0;num_attention_heads * current_token.len() * MAX_SEQ_LEN], vec![num_attention_heads,current_token.len(),MAX_SEQ_LEN]);
+    let mut s = Tensor::new(
+        vec![0.0; num_attention_heads * current_token.len() * MAX_SEQ_LEN],
+        vec![num_attention_heads, current_token.len(), MAX_SEQ_LEN],
+    );
 
-     let mut attn = Tensor::new(vec![0.0;MAX_SEQ_LEN * hidden_dim], vec![MAX_SEQ_LEN , hidden_dim]);
-     let mut attn_final = Tensor::new(vec![0.0;MAX_SEQ_LEN * hidden_dim], vec![MAX_SEQ_LEN , hidden_dim]);
+    let mut attn = Tensor::new(
+        vec![0.0; MAX_SEQ_LEN * hidden_dim],
+        vec![MAX_SEQ_LEN, hidden_dim],
+    );
+    let mut attn_final = Tensor::new(
+        vec![0.0; MAX_SEQ_LEN * hidden_dim],
+        vec![MAX_SEQ_LEN, hidden_dim],
+    );
 
-    let mut gate = Tensor::new(vec![0.0;current_token.len() * intermediate_size], vec![current_token.len(), intermediate_size]);
-    let mut up =Tensor::new(vec![0.0;current_token.len() * intermediate_size], vec![current_token.len(), intermediate_size]);
-    let mut ffn_x = Tensor::new(vec![0.0;current_token.len() * hidden_dim],vec![current_token.len(),hidden_dim]);
+    let mut gate = Tensor::new(
+        vec![0.0; current_token.len() * intermediate_size],
+        vec![current_token.len(), intermediate_size],
+    );
+    let mut up = Tensor::new(
+        vec![0.0; current_token.len() * intermediate_size],
+        vec![current_token.len(), intermediate_size],
+    );
+    let mut ffn_x = Tensor::new(
+        vec![0.0; current_token.len() * hidden_dim],
+        vec![current_token.len(), hidden_dim],
+    );
 
-    let mut logits = Tensor::new(vec![0.0;vocab_size], vec![vocab_size]);
+    let mut logits = Tensor::new(vec![0.0; vocab_size], vec![vocab_size]);
 
+    let mut x: Tensor = Tensor::new(vec![0.0; MAX_SEQ_LEN * hidden_dim], vec![0]);
 
     #[cfg(feature = "bench")]
-    println!("⚡ [BENCH] 当前 Token 准备耗时: {:?}", inference_start.elapsed());
+    println!(
+        "⚡ [BENCH] 当前 Token 准备耗时: {:?}",
+        inference_start.elapsed()
+    );
     #[cfg(feature = "bench")]
-    time_vec.push(inference_start.elapsed()  - time_vec.iter().sum());
-    
-    let mut x:Tensor = Tensor::new(vec![0.0;MAX_SEQ_LEN * hidden_dim], vec![0]);
-    
+    call_indicator!();
+
     //big loop :D
     loop {
+        #[cfg(feature = "bench")]
+        monitor.enter();
+
         token_embedding(&current_token, &embed_weight, &mut x).expect("fuck");
-        //println!("Rust Token 0 Embedding 头 5 个值: {:?}", &x.data[0..5]);
+
+        #[cfg(feature = "bench")]
+        monitor.exit(FnIndex::TokenEmbedding);
 
         let seq_length = current_token.len();
-        
-        for layer in 0..layer_count {
 
-            if current_pos >= MAX_SEQ_LEN { break; }
+        for layer in 0..layer_count {
+            if current_pos >= MAX_SEQ_LEN {
+                break;
+            }
 
             //update the buf shape
             q_buf.update_shape(vec![seq_length, num_attention_heads, head_dim]);
             k_buf.update_shape(vec![seq_length, num_key_value_heads, head_dim]);
-            v_buf.update_shape(vec![seq_length,num_key_value_heads,head_dim]);
+            v_buf.update_shape(vec![seq_length, num_key_value_heads, head_dim]);
 
             //undergo input layernorm
             let layernorm_weight = get_weight_matrix(
@@ -172,8 +235,15 @@ fn main() {
                 header_size,
             )
             .expect("cannot get layernorm weight.");
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
+
             let x_process = rmsnorm(&x, &layernorm_weight, hidden_dim, epsilon as f32)
                 .expect("cannot run RMSnorm");
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::RmsNormInput);
 
             //get all weight of QKV
             let q_weight = get_weight_matrix(
@@ -183,7 +253,7 @@ fn main() {
                 header_size,
             )
             .expect("cannot get q weight");
-            
+
             let q_bias = get_weight_matrix(
                 &format!("model.layers.{}.self_attn.q_proj.bias", layer).to_string(),
                 &structure_json,
@@ -191,10 +261,6 @@ fn main() {
                 header_size,
             )
             .expect("cannot get q bias");
-            //print!("{:?}",q_bias.shape);
-
-            linear_proj(&x_process, &q_weight, &q_bias, &mut q_buf).expect("cannot get q");
-            //println!("q is {:?}",q_buf.shape);
 
             let k_weight = get_weight_matrix(
                 &format!("model.layers.{}.self_attn.k_proj.weight", layer).to_string(),
@@ -211,9 +277,6 @@ fn main() {
             )
             .expect("cannot get k weight");
 
-            linear_proj(&x_process, &k_weight, &k_bias, &mut k_buf).expect("cannot get k");
-            //println!("k is {:?}",&k_buf.shape);
-
             let v_weight = get_weight_matrix(
                 &format!("model.layers.{}.self_attn.v_proj.weight", layer).to_string(),
                 &structure_json,
@@ -229,8 +292,18 @@ fn main() {
             )
             .expect("cannot get v weight");
 
+            #[cfg(feature = "bench")]
+            monitor.enter();
+
+            linear_proj(&x_process, &q_weight, &q_bias, &mut q_buf).expect("cannot get q");
+            linear_proj(&x_process, &k_weight, &k_bias, &mut k_buf).expect("cannot get k");
             linear_proj(&x_process, &v_weight, &v_bias, &mut v_buf).expect("cannot get v");
-            //println!("v is {:?}",&v_buf.shape);
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::QkvProj);
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
 
             //GO ROPE!!!!!!!!!!
             let rope_theta = config["rope_theta"]
@@ -238,6 +311,9 @@ fn main() {
                 .expect("Cannot get rope theta") as f32;
             apply_rope(&mut q_buf, rope_theta, current_pos);
             apply_rope(&mut k_buf, rope_theta, current_pos);
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::rope);
 
             let seq_len = k_buf.shape[0];
             let chunk_size = seq_len * num_key_value_heads * head_dim;
@@ -248,26 +324,48 @@ fn main() {
             k_cache[layer].data[start_idx..end_idx].copy_from_slice(&k_buf.data[0..chunk_size]);
             v_cache[layer].data[start_idx..end_idx].copy_from_slice(&v_buf.data[0..chunk_size]);
 
-            let valid_kv_len = current_pos + seq_length;  // 已填入的有效 KV 数量
+            let valid_kv_len = current_pos + seq_length; // 已填入的有效 KV 数量
 
             //Cal Score!
-            let attn_start_pos = if current_pos == 0 { 
-                seq_length - 1  // prefill：最后一个 token 在位置 seq_len-1
-            } else { 
-                current_pos     // decode：当前 token 的绝对位置
+            let attn_start_pos = if current_pos == 0 {
+                seq_length - 1 // prefill：最后一个 token 在位置 seq_len-1
+            } else {
+                current_pos // decode：当前 token 的绝对位置
             };
-            attention_score(&q_buf, &k_cache[layer], kv_group,valid_kv_len,attn_start_pos, &mut s).expect("cannot get score");   // Need new Tensor
-            
-            //print!("{:?}", &s.shape);
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
+
+            attention_score(
+                &q_buf,
+                &k_cache[layer],
+                kv_group,
+                valid_kv_len,
+                attn_start_pos,
+                &mut s,
+            )
+            .expect("cannot get score"); // Need new Tensor
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::AttentionScore);
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
+
             //softmax
             softmax(&mut s);
 
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::Softmax);
+
             //cal O times value
-            
-            attn_out(&s, &v_cache[layer], kv_group, &mut attn).expect("cannot get attn");       // here need new Tensor
+
+            attn_out(&s, &v_cache[layer], kv_group, &mut attn).expect("cannot get attn"); // here need new Tensor
             attn.shape = vec![attn.shape[0], attn.shape[1] * attn.shape[2]];
             attn.strides = update_stride(&attn.shape).expect("cannot update stride");
-            //print!("{:?} and {:?}", attn.shape,attn.shape);
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
 
             //output projection
             let o_proj = get_weight_matrix(
@@ -278,12 +376,17 @@ fn main() {
             )
             .expect("cannot get o weight");
 
-            out_proj(&attn, &o_proj, &mut attn_final).expect("cannot get attn final");  // here need new Tensor
+            out_proj(&attn, &o_proj, &mut attn_final).expect("cannot get attn final"); // here need new Tensor
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::OutProj);
 
             //residual connection
             //using x
             res_conn(&mut x, &attn_final);
-            //print!("{:?}",&x);
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
 
             //MLP
             let post_attn_layernorm = get_weight_matrix(
@@ -307,7 +410,7 @@ fn main() {
                 header_size,
             )
             .expect("cannot get ml up proj");
-            let mlp_down =get_weight_matrix(
+            let mlp_down = get_weight_matrix(
                 &format!("model.layers.{}.mlp.down_proj.weight", layer).to_string(),
                 &structure_json,
                 &mmap,
@@ -319,14 +422,19 @@ fn main() {
             let post_afternorm = rmsnorm(&x, &post_attn_layernorm, hidden_dim, epsilon as f32)
                 .expect("cannot perform layernorm");
             mlp_mul(&post_afternorm, &mlp_gate, &mut gate).expect("cannot mul gate");
-            mlp_mul(&post_afternorm, &mlp_up, &mut up).expect("cannot mul up");     // here need new Tensor
+            mlp_mul(&post_afternorm, &mlp_up, &mut up).expect("cannot mul up"); // here need new Tensor
             silu(&mut gate, &up);
 
-            mlp_mul(&gate, &mlp_down, &mut ffn_x).expect("cannot perform mlp_mul");     // here need new Tensor
+            mlp_mul(&gate, &mlp_down, &mut ffn_x).expect("cannot perform mlp_mul"); // here need new Tensor
+
+            #[cfg(feature = "bench")]
+            monitor.exit(FnIndex::MlpBlock);
 
             res_conn(&mut x, &ffn_x);
-
         }
+
+        #[cfg(feature = "bench")]
+        monitor.enter();
 
         //last!!!!!
         let last_token_data =
@@ -337,8 +445,9 @@ fn main() {
             strides: update_stride(&vec![1, hidden_dim]).expect("cannot get stride"),
         };
 
-        let lm_head_weight = get_weight_matrix("model.norm.weight", &structure_json, &mmap, header_size,)
-            .expect("cannot get norm weight");
+        let lm_head_weight =
+            get_weight_matrix("model.norm.weight", &structure_json, &mmap, header_size)
+                .expect("cannot get norm weight");
         let last_norm =
             rmsnorm(&last_token, &lm_head_weight, hidden_dim, epsilon as f32).expect("cannot norm");
 
@@ -363,6 +472,7 @@ fn main() {
             .map(|(i, val)| (i, *val))
             .collect();
         tuple.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+
 
         let mut cumulative_prob = 0.0;
         let mut id: usize = 0;
@@ -399,6 +509,9 @@ fn main() {
             max_score = tuple[0].1
         }
 
+        #[cfg(feature = "bench")]
+        monitor.exit(FnIndex::LmHead);
+
         //greddy search
         //let (next_token_id, max_score) = logits
         //    .data
@@ -422,18 +535,26 @@ fn main() {
         }
 
         #[cfg(feature = "dhat_heap")]
-        if(current_pos >= 50) {break;}
-        
-
+        if (current_pos >= 50) {
+            break;
+        }
 
         //bench
         #[cfg(feature = "bench")]
-        println!("⚡ [BENCH] 当前 Token 生成耗时: {:?}", inference_start.elapsed());
+        println!(
+            "⚡ [BENCH] 一共 Token 生成耗时: {:?}",
+            inference_start.elapsed()
+        );
         #[cfg(feature = "bench")]
-        time_vec.push(inference_start.elapsed() - time_vec.iter().sum());
+        call_indicator!();
+        ();
         #[cfg(feature = "bench")]
-        println!("{:?}",time_vec);
+        print!("{:?}", time_vec.clone());
 
+        #[cfg(feature = "bench")]
+        monitor.print_report();
+        #[cfg(feature = "bench")]
+        monitor.reset();
     }
 
     //print!("{:?}", x);

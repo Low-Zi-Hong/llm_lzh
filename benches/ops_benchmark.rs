@@ -2,13 +2,16 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use llm_lzh::{
-    llm::{apply_rope, linear_proj, mlp_mul, rmsnorm, silu, attention_score,res_conn, attn_out, softmax},
-    tensor::{Tensor,WeightTensor},
+    llm::{
+        apply_rope, attention_score, attn_out, linear_proj, mlp_mul, res_conn, rmsnorm, silu,
+        softmax,
+    },
+    tensor::{Tensor, WeightTensor},
 };
 use rayon::vec;
 
 fn mock_f32_to_bf16(val: f32) -> u16 {
-(val.to_bits() >> 16) as u16
+    (val.to_bits() >> 16) as u16
 }
 
 //[Generate by Gemini]
@@ -20,7 +23,10 @@ fn bench_core_ops(c: &mut Criterion) {
     // ==========================================
     let input_1d = Tensor::new(vec![0.5; 896], vec![1, 896]);
     let raw_f32 = vec![1.0; 896];
-    let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let w_data = raw_f32
+        .iter()
+        .map(|&x| mock_f32_to_bf16(x))
+        .collect::<Vec<u16>>();
     let weight_1d = WeightTensor::new(&w_data, vec![896]);
 
     group.bench_function("rmsnorm_896", |b| {
@@ -52,7 +58,7 @@ fn bench_core_ops(c: &mut Criterion) {
     let mut rope_t = Tensor::new(vec![0.5; 1 * 14 * 64], vec![1, 14, 64]);
     group.bench_function("apply_rope_1x14x64 (in-place)", |b| {
         b.iter(|| {
-            apply_rope(black_box(&mut rope_t), 10000.0,0);
+            apply_rope(black_box(&mut rope_t), 10000.0, 0);
             black_box(&rope_t);
         })
     });
@@ -63,13 +69,16 @@ fn bench_core_ops(c: &mut Criterion) {
     // ==========================================
     let mlp_x = Tensor::new(vec![0.5; 896], vec![1, 896]);
     let raw_f32 = vec![0.1; 896 * 3584];
-        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let w_data = raw_f32
+        .iter()
+        .map(|&x| mock_f32_to_bf16(x))
+        .collect::<Vec<u16>>();
     let mlp_w = WeightTensor::new(&w_data, vec![896, 3584]);
-    let mut out = Tensor::new(vec![0.0;3584],vec![1,3584]);
+    let mut out = Tensor::new(vec![0.0; 3584], vec![1, 3584]);
 
     group.bench_function("mlp_mul_896x3584 (with alloc)", |b| {
         b.iter(|| {
-            mlp_mul(black_box(&mlp_x), black_box(&mlp_w),black_box(&mut out)).unwrap();
+            mlp_mul(black_box(&mlp_x), black_box(&mlp_w), black_box(&mut out)).unwrap();
         })
     });
 
@@ -80,17 +89,29 @@ fn bench_core_ops(c: &mut Criterion) {
     // ==========================================
     let lin_x = Tensor::new(vec![0.5; 896], vec![1, 896]);
     let raw_f32 = vec![0.1; 896 * 896];
-        let w_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let w_data = raw_f32
+        .iter()
+        .map(|&x| mock_f32_to_bf16(x))
+        .collect::<Vec<u16>>();
     let lin_w = WeightTensor::new(&w_data, vec![896, 896]);
     let raw_f32 = vec![0.0; 896];
-        let b_data = raw_f32.iter().map(|&x| mock_f32_to_bf16(x)).collect::<Vec<u16>>();
+    let b_data = raw_f32
+        .iter()
+        .map(|&x| mock_f32_to_bf16(x))
+        .collect::<Vec<u16>>();
     let lin_bias = WeightTensor::new(&b_data, vec![896]); // 如果你的签名需要 bias
     let mut lin_out = Tensor::new(vec![0.0; 896], vec![1, 896]);
 
     group.bench_function("linear_proj_896x896 (in-place)", |b| {
         b.iter(|| {
             // 请根据你实际的 linear_proj 签名调整参数
-            linear_proj(black_box(&lin_x), black_box(&lin_w), black_box(&lin_bias), black_box(&mut lin_out)).unwrap();
+            linear_proj(
+                black_box(&lin_x),
+                black_box(&lin_w),
+                black_box(&lin_bias),
+                black_box(&mut lin_out),
+            )
+            .unwrap();
             black_box(&lin_out);
         })
     });
@@ -102,14 +123,22 @@ fn bench_core_ops(c: &mut Criterion) {
     // 假设 1 个 head，head_dim = 64
     let q_attn = Tensor::new(vec![0.5; 64], vec![1, 1, 64]);
     // 假装这是 k_cache 里的一层，已经存了 1024 个 token
-    let k_attn = Tensor::new(vec![0.5; 1024 * 1 * 64], vec![1024, 1, 64]); 
-    let mut score = Tensor::new(vec![0.0;1000*1000],vec![0]);
-    
+    let k_attn = Tensor::new(vec![0.5; 1024 * 1 * 64], vec![1024, 1, 64]);
+    let mut score = Tensor::new(vec![0.0; 1000 * 1000], vec![0]);
+
     group.bench_function("attention_score_1x1024 (in-place)", |b| {
         b.iter(|| {
             // 假设你的参数是 (q, k, seq_len/pos, heads, head_dim) 等，请对齐你的真实签名
             // 注意：如果内部有 vec![] 分配，这个耗时会明显飙升
-            attention_score(black_box(&q_attn), black_box(&k_attn), black_box(1), black_box(1024), black_box(1024),black_box(&mut score)).unwrap();
+            attention_score(
+                black_box(&q_attn),
+                black_box(&k_attn),
+                black_box(1),
+                black_box(1024),
+                black_box(1024),
+                black_box(&mut score),
+            )
+            .unwrap();
         })
     });
 
@@ -134,7 +163,7 @@ fn bench_core_ops(c: &mut Criterion) {
     // 必须是 In-place 原位修改，否则分配内存的开销会比算 exp() 还大！
     // ==========================================
     let mut score_buf = Tensor::new(vec![0.5; 14 * 1024], vec![1, 14, 1024]);
-    
+
     group.bench_function("softmax_1x14x1024 (in-place)", |b| {
         b.iter(|| {
             // ⚠️ 注意：请根据你实际的 softmax 函数签名调整
@@ -161,19 +190,18 @@ fn bench_core_ops(c: &mut Criterion) {
         b.iter(|| {
             // ⚠️ 注意：请根据你实际的 attn_out 函数签名调整
             // 比如有些实现需要传入 heads 数量或者 current_pos 边界
-             attn_out(
-                black_box(&prob_buf), 
-                black_box(&v_cache_layer), 
-                2 // 👈 必须是零分配传参！
-                ,black_box(&mut attn_out_buf)
-                // , black_box(1024) // 如果你需要传 current_pos 的话
-            ).expect("fuck");
+            attn_out(
+                black_box(&prob_buf),
+                black_box(&v_cache_layer),
+                2,                            // 👈 必须是零分配传参！
+                black_box(&mut attn_out_buf), // , black_box(1024) // 如果你需要传 current_pos 的话
+            )
+            .expect("fuck");
         })
     });
 
     group.finish();
 }
-
 
 criterion_group!(core_group, bench_core_ops);
 criterion_main!(core_group);
