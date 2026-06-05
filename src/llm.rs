@@ -2,7 +2,12 @@ use crate::tensor::{Tensor, WeightTensor, bf16_u16_to_f32, bytes_to_u16_slice, u
 use std::{time::UNIX_EPOCH, vec};
 
 use memmap::Mmap;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde_json::Value;
+
+use rayon::prelude::*;
+
+const rayon_thresshold:usize = 10;
 
 pub fn get_weight_shape(weight_name: &str, structure_json: &Value) -> Result<Vec<usize>, String> {
     let value = structure_json[weight_name].clone();
@@ -270,6 +275,18 @@ pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize, attn: &mut Tensor) -> R
 }
 
 pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+
+
+    if attn.shape[0] > rayon_thresshold {
+        out_proj_rayon(attn, o, atten_fn);
+    } else {
+        out_proj_single(attn, o, atten_fn);
+    }
+
+    Ok(())
+}
+
+pub fn out_proj_single(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
     atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
 
     assert!(
@@ -296,6 +313,47 @@ pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Resul
     Ok(())
 }
 
+pub fn out_proj_rayon(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+    atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
+
+    assert!(
+        atten_fn.data.len() >= atten_fn.shape.iter().product(),
+        "attn shape wrong"
+    );
+    atten_fn.data.fill(0.0);
+
+    let o0 = o.strides[0];
+    let a0 = attn.strides[0];
+
+    let o_rows = o.shape[0];
+    let k_len = attn.shape[1];
+
+    let total = atten_fn.shape.iter().product();
+
+    atten_fn.data[..total]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(idx,out_val)|{
+            let i = idx / o_rows;
+            let k = idx % o_rows;
+            
+            let x_row_offset = i * a0;
+            let w_row_offset = k * o0;
+
+            let mut sum = 0.0;
+            for j in 0..k_len {
+                let attn_val = attn.data[x_row_offset + j];
+                let o_val = bf16_u16_to_f32(o.data[w_row_offset + j]);
+
+                sum += attn_val * o_val;
+            }
+            *out_val = sum;
+        });
+
+    Ok(())
+}
+
+
 pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
     //print!("{:?}",x.shape);
     let valid_data: usize = x.shape.iter().product();
@@ -306,6 +364,17 @@ pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
 }
 
 pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
+
+    if x.shape[0] > rayon_thresshold {
+        mlp_mul_rayon(x, weight, output);
+    } else {
+        mlp_mul_single(x, weight, output);
+    }
+
+Ok(())
+}
+
+pub fn mlp_mul_single(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
     output.update_shape(vec![x.shape[0], weight.shape[0]]);
     let s1 = x.strides[0];
@@ -327,6 +396,45 @@ pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result
             output.data[i * o1 + k * o2] = sum;
         }
     }
+
+    Ok(())
+}
+
+pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
+    //print!("{:?} : {:?}", x.shape, weight.shape);
+    output.update_shape(vec![x.shape[0], weight.shape[0]]);
+    let s1 = x.strides[0];
+    let s2 = x.strides[1];
+    let w1 = weight.strides[0];
+    let w2 = weight.strides[1];
+    let o1 = output.strides[0];
+    let o2 = output.strides[1];
+
+    let x_width = x.shape[1];
+    let weight_rows = weight.shape[0];
+
+    let total:usize = output.shape.iter().product();
+
+    output.data[..total]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(idx,out_val)|{
+            let i = idx / weight_rows;
+            let k = idx % weight_rows;
+            
+            let x_row_offset = i * s1;
+            let w_row_offset = k*w1;
+
+            let mut sum = 0.0;
+            for j in 0..weight.shape[1] {
+                let x_val = x.data[x_row_offset + j * s2];
+
+                let w_val = bf16_u16_to_f32(weight.data[w_row_offset + j * w2]);
+
+                sum += x_val * w_val;
+            }
+            *out_val = sum;
+        });
 
     Ok(())
 }

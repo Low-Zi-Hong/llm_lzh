@@ -40,7 +40,7 @@ impl GlobalMonitor {
     #[inline(always)]
     pub fn exit(&mut self, func: FnIndex) {
         // 【极致优雅】：Duration 原生支持 += 运算，连 as_nanos 都省了！
-        self.accum_times[func as usize] = self.start_slot.elapsed();
+        self.accum_times[func as usize] += self.start_slot.elapsed();
     }
 
     // 打印的时候，再把它榨取成带小数点的微秒！

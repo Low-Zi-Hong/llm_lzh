@@ -73,7 +73,7 @@ fn bench_core_ops(c: &mut Criterion) {
         .iter()
         .map(|&x| mock_f32_to_bf16(x))
         .collect::<Vec<u16>>();
-    let mlp_w = WeightTensor::new(&w_data, vec![896, 3584]);
+    let mlp_w = WeightTensor::new(&w_data, vec![3584, 896]);
     let mut out = Tensor::new(vec![0.0; 3584], vec![1, 3584]);
 
     group.bench_function("mlp_mul_896x3584 (with alloc)", |b| {

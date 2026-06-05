@@ -26,6 +26,9 @@ use llm::{
 mod load;
 use load::raw_to_json;
 
+mod tokenizer;
+use tokenizer::Tokenizer;
+
 //dhat :D
 #[cfg(feature = "dhat_heap")]
 use dhat;
@@ -66,9 +69,15 @@ fn main() {
     #[cfg(feature = "bench")]
     let mut monitor = GlobalMonitor::new();
 
+    //tokenizer
+    let mut tokenizer = Tokenizer::new("tokenizer.json");
+    //print!("{:?}",tokenizer);
 
-    let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
+    let mut result_string:String = "".to_string();
+
+    let raw_token = vec![151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 108386, 3837, 61443, 108462, 100045, 104169, 1773, 151645, 198, 151644, 77091, 198];
     println!("Running llm with input token as: {:?}", raw_token);
+    raw_token.iter().for_each(|x| result_string.push_str(&tokenizer.decode(*x as u32)));
 
     //process token
     let mut whole_token_list: Vec<usize> = raw_token.clone();
@@ -76,12 +85,12 @@ fn main() {
     let mut current_pos: usize = 0;
 
     //load config.json
-    let config_path: String = "config.json".to_string();
+    let config_path: String = "./config.json".to_string();
     let config_raw = fs::read_to_string(config_path).expect("cannot read config file.");
     let config: Value = serde_json::from_str(&config_raw).expect("cannot parse config file");
 
     //model path
-    let file_path = "model.safetensors";
+    let file_path = "./model.safetensors";
 
     //open the file and use mmap to map to memory
     let file = File::open(file_path).unwrap();
@@ -530,9 +539,16 @@ fn main() {
         current_pos += seq_length;
         current_token = vec![next_token_id];
 
+        let result_str = tokenizer.decode(next_token_id as u32);
+        result_string.push_str(&result_str);
+        println!("Result: {}", result_string);
+        
+
         if next_token_id == 151643 || next_token_id == 151645 {
             break;
         }
+
+
 
         #[cfg(feature = "dhat_heap")]
         if (current_pos >= 50) {
