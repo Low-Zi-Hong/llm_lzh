@@ -2,12 +2,12 @@ use crate::tensor::{Tensor, WeightTensor, bf16_u16_to_f32, bytes_to_u16_slice, u
 use std::{time::UNIX_EPOCH, vec};
 
 use memmap::Mmap;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::{in_place_scope, iter::{IntoParallelIterator, ParallelIterator}};
 use serde_json::Value;
 
 use rayon::prelude::*;
 
-const rayon_thresshold:usize = 10;
+const rayon_thresshold:usize = 0;
 
 pub fn get_weight_shape(weight_name: &str, structure_json: &Value) -> Result<Vec<usize>, String> {
     let value = structure_json[weight_name].clone();
@@ -120,13 +120,17 @@ pub fn linear_proj(
     for i in 0..input_shape[0] {
         for j in 0..weight_shape[0] {
             let mut sum = 0.0;
-            for k in 0..input_shape[1] {
-                // Flat index formulas for 2D array representation
-                let idx_input = i * input_shape[1] + k;
-                let idx_weight = j * weight_shape[1] + k;
 
-                sum += input.data[idx_input] * bf16_u16_to_f32(weight.data[idx_weight]);
-            }
+            let x_start = i * input_shape[1];
+            let x_end = (i + 1) * input_shape[1];
+            let w_start = j * weight_shape[1];
+            let w_end = (j + 1) * weight_shape[1];
+
+            let x_slices = &input.data[x_start..x_end];
+            let w_slices = &weight.data[w_start..w_end];
+
+            sum = dot_avx2_bf16(x_slices, w_slices);
+
             // Store the final dot product result
             let out_idx = i * q.strides[0] + j;
             q.data[out_idx] = sum + bf16_u16_to_f32(bias.data[j]);
@@ -336,18 +340,15 @@ pub fn out_proj_rayon(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) ->
         .for_each(|(idx,out_val)|{
             let i = idx / o_rows;
             let k = idx % o_rows;
+
             
             let x_row_offset = i * a0;
             let w_row_offset = k * o0;
+            
+            let x_slices = &attn.data[x_row_offset .. x_row_offset + o.shape[1]];
+            let w_slices = &o.data[w_row_offset .. w_row_offset + o.shape[1]];
 
-            let mut sum = 0.0;
-            for j in 0..k_len {
-                let attn_val = attn.data[x_row_offset + j];
-                let o_val = bf16_u16_to_f32(o.data[w_row_offset + j]);
-
-                sum += attn_val * o_val;
-            }
-            *out_val = sum;
+            *out_val = dot_avx2_bf16(x_slices, w_slices);
         });
 
     Ok(())
@@ -365,7 +366,7 @@ pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
 
 pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
 
-    if x.shape[0] > rayon_thresshold {
+    if x.shape[0] >= rayon_thresshold {
         mlp_mul_rayon(x, weight, output);
     } else {
         mlp_mul_single(x, weight, output);
@@ -383,16 +384,19 @@ pub fn mlp_mul_single(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) ->
     let w2 = weight.strides[1];
     let o1 = output.strides[0];
     let o2 = output.strides[1];
+    let weight_rows = weight.shape[0];
+    let weight_col = weight.shape[1];
+
+    
     for i in 0..x.shape[0] {
         for k in 0..weight.shape[0] {
-            let mut sum = 0.0;
-            for j in 0..x.shape[1] {
-                let x_val = x.data[i * s1 + j * s2];
+            
+            let x_row_offset = i * s1;
+            let w_row_offset = k*w1;
 
-                let w_val = bf16_u16_to_f32(weight.data[(k * w1) + (j * w2)]);
-
-                sum += x_val * w_val;
-            }
+            let x_slice = &x.data[x_row_offset .. x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset .. w_row_offset + weight_col * w2];
+            let sum = dot_avx2_bf16(x_slice, w_slice);
             output.data[i * o1 + k * o2] = sum;
         }
     }
@@ -400,6 +404,7 @@ pub fn mlp_mul_single(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) ->
     Ok(())
 }
 
+use core::arch::x86_64::*;
 pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
     output.update_shape(vec![x.shape[0], weight.shape[0]]);
@@ -407,16 +412,14 @@ pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> 
     let s2 = x.strides[1];
     let w1 = weight.strides[0];
     let w2 = weight.strides[1];
-    let o1 = output.strides[0];
-    let o2 = output.strides[1];
-
-    let x_width = x.shape[1];
     let weight_rows = weight.shape[0];
+    let weight_col = weight.shape[1];
 
     let total:usize = output.shape.iter().product();
 
     output.data[..total]
         .par_iter_mut()
+        .with_min_len(5)
         .enumerate()
         .for_each(|(idx,out_val)|{
             let i = idx / weight_rows;
@@ -425,18 +428,68 @@ pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> 
             let x_row_offset = i * s1;
             let w_row_offset = k*w1;
 
-            let mut sum = 0.0;
-            for j in 0..weight.shape[1] {
-                let x_val = x.data[x_row_offset + j * s2];
+            let mut sum: f32 = 0.0;
 
-                let w_val = bf16_u16_to_f32(weight.data[w_row_offset + j * w2]);
+            let x_slice = &x.data[x_row_offset .. x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset .. w_row_offset + weight_col * w2];
 
-                sum += x_val * w_val;
-            }
+
+
+            sum = dot_avx2_bf16(x_slice, w_slice);
+
+            
             *out_val = sum;
         });
 
     Ok(())
+}
+
+fn dot_avx2_bf16(x:&[f32], w:&[u16]) -> f32 {
+    let mut sum = 0.0;
+                //let prefetch_dis = 32;
+    unsafe{
+                let mut sum_vec = _mm256_setzero_ps();
+
+                let mut x_chunks = x.chunks_exact(8);
+                let mut w_chunks = w.chunks_exact(8);
+
+                for (x_chunk,w_chunk) in x_chunks.by_ref().zip(w_chunks.by_ref()) {
+                    let x_ptr = x_chunk.as_ptr();
+                    let x_vec = _mm256_loadu_ps(x_ptr);
+
+                    let w_ptr = w_chunk.as_ptr();
+                    let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
+
+                    //here do prefetch
+                    //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
+
+                    //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
+
+                    let w_256_int = _mm256_cvtepu16_epi32(w_128);
+
+                    let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
+
+                    let w_vec = _mm256_castsi256_ps(w_256_shifted);
+
+                    sum_vec = _mm256_fmadd_ps(x_vec, w_vec, sum_vec);
+
+                }
+                let mut arr = [0.0f32;8];
+                _mm256_storeu_ps(arr.as_mut_ptr(),sum_vec);
+
+                sum = arr.iter().sum();
+
+                let x_rem = x_chunks.remainder();
+                let w_rem = w_chunks.remainder();
+                for i in 0..x_rem.len() {
+                    let x_val = x_rem[i];
+                    let w_val = bf16_u16_to_f32(w_rem[i]);
+                    sum += x_val * w_val;
+                }
+
+            }
+
+            sum
 }
 
 pub fn silu(weight: &mut Tensor, up: &Tensor) {

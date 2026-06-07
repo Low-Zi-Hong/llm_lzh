@@ -1,3 +1,4 @@
+use core::slice;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::Hash;
@@ -12,6 +13,12 @@ pub struct Tokenizer {
     decode_map: HashMap<u32, String>,
     byte_decoder: HashMap<char,u8>,
     buffer: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum Chunk<'a> {
+    SpecialId(u32),
+    Text(&'a str),
 }
 
 impl Tokenizer {
@@ -65,8 +72,30 @@ impl Tokenizer {
         token_map
     }
 
-    //pub fn encode(&self, text: &str) -> Vec<u32> {
 
+
+    //pub fn encode(&self, text: String) -> Vec<u32> {
+    //    let chunk_vec:Vec<Chunk> = vec![];
+    //    let mut remaining_text = text;
+    //    let mut last_id:usize = 0;
+//
+    //    while !remaining_text.is_empty() {
+    //        let
+    //        
+    //    }
+//
+//
+    //    for (special_str, special_id) in self.special_map.iter(){
+    //        if let Some(start_idx ) = text.find(special_str) {
+    //            let end_idx = start_idx + special_str.len();
+    //            chunk_vec.push(Chunk::SpecialId( *special_id));
+    //            chunk_vec.push(Chunk::Text(&text[last_id..start_idx]));
+    //            last_id = end_idx + 1;
+    //        }
+    //    };
+    //    chunk_vec.push(Chunk::Text(&text[last_id..text.len()]));
+//
+    //    result
     //}
 
     pub fn decode(&mut self, token_id:u32) -> String {

@@ -1,6 +1,7 @@
 // 1. 定义你想监控的算子清单
 #[derive(Debug, Clone, Copy)]
 pub enum FnIndex {
+    TokenizerDecode= 9,
     TokenEmbedding = 0,
     RmsNormInput   = 1,
     QkvProj        = 2,
@@ -13,23 +14,21 @@ pub enum FnIndex {
 }
 
 pub struct GlobalMonitor {
-    // 你把大小改成了 9，说明你加了新算子，没问题！
-    pub accum_times: [std::time::Duration; 9], 
+    pub accum_times: [std::time::Duration; 10], 
     pub start_slot: std::time::Instant,
 }
 
 impl GlobalMonitor {
     pub fn new() -> Self {
         Self {
-            // 【修正 1】：不能写类型，必须用 Duration::ZERO 填充初始值
-            accum_times: [std::time::Duration::ZERO; 9],
+            accum_times: [std::time::Duration::ZERO; 10],
             start_slot: std::time::Instant::now(),
         }
     }
 
     pub fn reset(&mut self) {
         // 【修正 2】：不能直接赋 0，要用 Duration::ZERO
-        self.accum_times = [std::time::Duration::ZERO; 9];
+        self.accum_times = [std::time::Duration::ZERO; 10];
     }
 
     #[inline(always)]
@@ -61,6 +60,7 @@ impl GlobalMonitor {
         println!("Out Projection  : {:?}", self.accum_times[FnIndex::OutProj as usize]);
         println!("MLP Block       : {:?}", self.accum_times[FnIndex::MlpBlock as usize]);
         println!("LM Head         : {:?}", self.accum_times[FnIndex::LmHead as usize]);
+        println!("Token Decode    : {:?}", self.accum_times[FnIndex::TokenizerDecode as usize]);
         println!("=============================================");
     }
 }

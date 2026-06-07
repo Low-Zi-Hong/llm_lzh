@@ -69,13 +69,24 @@ fn main() {
     #[cfg(feature = "bench")]
     let mut monitor = GlobalMonitor::new();
 
-    //tokenizer
-    let mut tokenizer = Tokenizer::new("tokenizer.json");
-    //print!("{:?}",tokenizer);
+    //path
+    let mut tokenizer = Tokenizer::new("./tokenizer.json");
+    let config_path: String = "./config.json".to_string();
+    let file_path = "./model.safetensors";
+    //./model_qwen
 
+    //encoding
+    let raw_string = "<|im_start|>fuck you".to_string();
+    //let vec = tokenizer.encode(raw_string);
+    //print!("{:?}",vec);
+    
+
+    //raw token
+    let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
+
+    //tokenizer
     let mut result_string:String = "".to_string();
 
-    let raw_token = vec![151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 108386, 3837, 61443, 108462, 100045, 104169, 1773, 151645, 198, 151644, 77091, 198];
     println!("Running llm with input token as: {:?}", raw_token);
     raw_token.iter().for_each(|x| result_string.push_str(&tokenizer.decode(*x as u32)));
 
@@ -85,12 +96,9 @@ fn main() {
     let mut current_pos: usize = 0;
 
     //load config.json
-    let config_path: String = "./config.json".to_string();
+
     let config_raw = fs::read_to_string(config_path).expect("cannot read config file.");
     let config: Value = serde_json::from_str(&config_raw).expect("cannot parse config file");
-
-    //model path
-    let file_path = "./model.safetensors";
 
     //open the file and use mmap to map to memory
     let file = File::open(file_path).unwrap();
@@ -394,9 +402,6 @@ fn main() {
             //using x
             res_conn(&mut x, &attn_final);
 
-            #[cfg(feature = "bench")]
-            monitor.enter();
-
             //MLP
             let post_attn_layernorm = get_weight_matrix(
                 &format!("model.layers.{}.post_attention_layernorm.weight", layer).to_string(),
@@ -426,6 +431,9 @@ fn main() {
                 header_size,
             )
             .expect("cannot get mlp down proj");
+
+            #[cfg(feature = "bench")]
+            monitor.enter();
 
             //post layer norm
             let post_afternorm = rmsnorm(&x, &post_attn_layernorm, hidden_dim, epsilon as f32)
@@ -539,7 +547,11 @@ fn main() {
         current_pos += seq_length;
         current_token = vec![next_token_id];
 
+        #[cfg(feature = "bench")]
+        monitor.enter();
         let result_str = tokenizer.decode(next_token_id as u32);
+        #[cfg(feature = "bench")]
+        monitor.exit(FnIndex::TokenizerDecode);
         result_string.push_str(&result_str);
         println!("Result: {}", result_string);
         
