@@ -7,14 +7,15 @@ pub fn raw_to_json(raw: &[u8]) -> Result<Value, String> {
     Ok(structure_json)
 }
 
-pub fn convert_to_f32(num: [u8; 2]) -> Result<f32, String> {
-    Ok(f32::from_bits((u16::from_le_bytes(num) as u32) << 16))
-}
 
 //test [generate by Gemini :D]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub fn convert_to_f32(num: [u8; 2]) -> Result<f32, String> {
+    Ok(f32::from_bits((u16::from_le_bytes(num) as u32) << 16))
+}
 
     #[test]
     fn test_raw_to_json() {

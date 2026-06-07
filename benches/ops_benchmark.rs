@@ -8,7 +8,6 @@ use llm_lzh::{
     },
     tensor::{Tensor, WeightTensor},
 };
-use rayon::vec;
 
 fn mock_f32_to_bf16(val: f32) -> u16 {
     (val.to_bits() >> 16) as u16

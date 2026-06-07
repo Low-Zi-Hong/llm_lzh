@@ -1,14 +1,15 @@
-use crate::tensor::{Tensor, WeightTensor, bf16_u16_to_f32, bytes_to_u16_slice, update_stride};
+use crate::tensor::{Tensor, WeightTensor, bf16_u16_to_f32, bytes_to_u16_slice};
 use std::{time::UNIX_EPOCH, vec};
 
 use memmap::Mmap;
-use rayon::{in_place_scope, iter::{IntoParallelIterator, ParallelIterator}};
+use rayon::iter::ParallelIterator;
 use serde_json::Value;
 
 use rayon::prelude::*;
 
-const rayon_thresshold:usize = 0;
+const RAYON_THRESHOLD: usize = 0;
 
+/*
 pub fn get_weight_shape(weight_name: &str, structure_json: &Value) -> Result<Vec<usize>, String> {
     let value = structure_json[weight_name].clone();
 
@@ -20,7 +21,7 @@ pub fn get_weight_shape(weight_name: &str, structure_json: &Value) -> Result<Vec
         .collect();
 
     Ok(shape)
-}
+}*/
 
 pub fn get_weight_matrix<'a>(
     weight_name: &str,
@@ -119,8 +120,6 @@ pub fn linear_proj(
     // 3. Perform the triple loop matrix multiplication
     for i in 0..input_shape[0] {
         for j in 0..weight_shape[0] {
-            let mut sum = 0.0;
-
             let x_start = i * input_shape[1];
             let x_end = (i + 1) * input_shape[1];
             let w_start = j * weight_shape[1];
@@ -129,7 +128,7 @@ pub fn linear_proj(
             let x_slices = &input.data[x_start..x_end];
             let w_slices = &weight.data[w_start..w_end];
 
-            sum = dot_avx2_bf16(x_slices, w_slices);
+            let sum = dot_avx2_bf16(x_slices, w_slices);
 
             // Store the final dot product result
             let out_idx = i * q.strides[0] + j;
@@ -279,18 +278,20 @@ pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize, attn: &mut Tensor) -> R
 }
 
 pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
-
-
-    if attn.shape[0] > rayon_thresshold {
-        out_proj_rayon(attn, o, atten_fn);
+    if attn.shape[0] >= RAYON_THRESHOLD {
+        let _ = out_proj_rayon(attn, o, atten_fn);
     } else {
-        out_proj_single(attn, o, atten_fn);
+        let _ = out_proj_single(attn, o, atten_fn);
     }
 
     Ok(())
 }
 
-pub fn out_proj_single(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+pub fn out_proj_single(
+    attn: &Tensor,
+    o: &WeightTensor,
+    atten_fn: &mut Tensor,
+) -> Result<(), String> {
     atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
 
     assert!(
@@ -307,9 +308,9 @@ pub fn out_proj_single(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -
         let i_offset = i * a0;
         let af_offset = i * af0;
         for k in 0..attn.shape[1] {
-            let attn_val =attn.data[i_offset + k];
+            let attn_val = attn.data[i_offset + k];
             for j in 0..o.shape[0] {
-                atten_fn.data[af_offset + j] += attn_val  * bf16_u16_to_f32(o.data[(j * o0) + k]);
+                atten_fn.data[af_offset + j] += attn_val * bf16_u16_to_f32(o.data[(j * o0) + k]);
             }
         }
     }
@@ -317,7 +318,11 @@ pub fn out_proj_single(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -
     Ok(())
 }
 
-pub fn out_proj_rayon(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+pub fn out_proj_rayon(
+    attn: &Tensor,
+    o: &WeightTensor,
+    atten_fn: &mut Tensor,
+) -> Result<(), String> {
     atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
 
     assert!(
@@ -330,30 +335,28 @@ pub fn out_proj_rayon(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) ->
     let a0 = attn.strides[0];
 
     let o_rows = o.shape[0];
-    let k_len = attn.shape[1];
+    //let k_len = attn.shape[1];
 
     let total = atten_fn.shape.iter().product();
 
     atten_fn.data[..total]
         .par_iter_mut()
         .enumerate()
-        .for_each(|(idx,out_val)|{
+        .for_each(|(idx, out_val)| {
             let i = idx / o_rows;
             let k = idx % o_rows;
 
-            
             let x_row_offset = i * a0;
             let w_row_offset = k * o0;
-            
-            let x_slices = &attn.data[x_row_offset .. x_row_offset + o.shape[1]];
-            let w_slices = &o.data[w_row_offset .. w_row_offset + o.shape[1]];
+
+            let x_slices = &attn.data[x_row_offset..x_row_offset + o.shape[1]];
+            let w_slices = &o.data[w_row_offset..w_row_offset + o.shape[1]];
 
             *out_val = dot_avx2_bf16(x_slices, w_slices);
         });
 
     Ok(())
 }
-
 
 pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
     //print!("{:?}",x.shape);
@@ -365,17 +368,20 @@ pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
 }
 
 pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
-
-    if x.shape[0] >= rayon_thresshold {
-        mlp_mul_rayon(x, weight, output);
+    if x.shape[0] >= RAYON_THRESHOLD {
+        let _ = mlp_mul_rayon(x, weight, output);
     } else {
-        mlp_mul_single(x, weight, output);
+        let _ = mlp_mul_single(x, weight, output);
     }
 
-Ok(())
+    Ok(())
 }
 
-pub fn mlp_mul_single(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
+pub fn mlp_mul_single(
+    x: &Tensor,
+    weight: &WeightTensor,
+    output: &mut Tensor,
+) -> Result<(), String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
     output.update_shape(vec![x.shape[0], weight.shape[0]]);
     let s1 = x.strides[0];
@@ -384,18 +390,16 @@ pub fn mlp_mul_single(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) ->
     let w2 = weight.strides[1];
     let o1 = output.strides[0];
     let o2 = output.strides[1];
-    let weight_rows = weight.shape[0];
+    //let weight_rows = weight.shape[0];
     let weight_col = weight.shape[1];
 
-    
     for i in 0..x.shape[0] {
         for k in 0..weight.shape[0] {
-            
             let x_row_offset = i * s1;
-            let w_row_offset = k*w1;
+            let w_row_offset = k * w1;
 
-            let x_slice = &x.data[x_row_offset .. x_row_offset + weight_col * s2];
-            let w_slice = &weight.data[w_row_offset .. w_row_offset + weight_col * w2];
+            let x_slice = &x.data[x_row_offset..x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset..w_row_offset + weight_col * w2];
             let sum = dot_avx2_bf16(x_slice, w_slice);
             output.data[i * o1 + k * o2] = sum;
         }
@@ -415,81 +419,74 @@ pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> 
     let weight_rows = weight.shape[0];
     let weight_col = weight.shape[1];
 
-    let total:usize = output.shape.iter().product();
+    let total: usize = output.shape.iter().product();
 
     output.data[..total]
         .par_iter_mut()
         .with_min_len(5)
         .enumerate()
-        .for_each(|(idx,out_val)|{
+        .for_each(|(idx, out_val)| {
             let i = idx / weight_rows;
             let k = idx % weight_rows;
-            
+
             let x_row_offset = i * s1;
-            let w_row_offset = k*w1;
+            let w_row_offset = k * w1;
 
-            let mut sum: f32 = 0.0;
+            let x_slice = &x.data[x_row_offset..x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset..w_row_offset + weight_col * w2];
 
-            let x_slice = &x.data[x_row_offset .. x_row_offset + weight_col * s2];
-            let w_slice = &weight.data[w_row_offset .. w_row_offset + weight_col * w2];
+            let sum = dot_avx2_bf16(x_slice, w_slice);
 
-
-
-            sum = dot_avx2_bf16(x_slice, w_slice);
-
-            
             *out_val = sum;
         });
 
     Ok(())
 }
 
-fn dot_avx2_bf16(x:&[f32], w:&[u16]) -> f32 {
-    let mut sum = 0.0;
-                //let prefetch_dis = 32;
-    unsafe{
-                let mut sum_vec = _mm256_setzero_ps();
+fn dot_avx2_bf16(x: &[f32], w: &[u16]) -> f32 {
+    let mut sum;
+    //let prefetch_dis = 32;
+    unsafe {
+        let mut sum_vec = _mm256_setzero_ps();
 
-                let mut x_chunks = x.chunks_exact(8);
-                let mut w_chunks = w.chunks_exact(8);
+        let mut x_chunks = x.chunks_exact(8);
+        let mut w_chunks = w.chunks_exact(8);
 
-                for (x_chunk,w_chunk) in x_chunks.by_ref().zip(w_chunks.by_ref()) {
-                    let x_ptr = x_chunk.as_ptr();
-                    let x_vec = _mm256_loadu_ps(x_ptr);
+        for (x_chunk, w_chunk) in x_chunks.by_ref().zip(w_chunks.by_ref()) {
+            let x_ptr = x_chunk.as_ptr();
+            let x_vec = _mm256_loadu_ps(x_ptr);
 
-                    let w_ptr = w_chunk.as_ptr();
-                    let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
+            let w_ptr = w_chunk.as_ptr();
+            let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
 
-                    //here do prefetch
-                    //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
+            //here do prefetch
+            //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
 
-                    //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
+            //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
 
-                    let w_256_int = _mm256_cvtepu16_epi32(w_128);
+            let w_256_int = _mm256_cvtepu16_epi32(w_128);
 
-                    let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
+            let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
 
-                    let w_vec = _mm256_castsi256_ps(w_256_shifted);
+            let w_vec = _mm256_castsi256_ps(w_256_shifted);
 
-                    sum_vec = _mm256_fmadd_ps(x_vec, w_vec, sum_vec);
+            sum_vec = _mm256_fmadd_ps(x_vec, w_vec, sum_vec);
+        }
+        let mut arr = [0.0f32; 8];
+        _mm256_storeu_ps(arr.as_mut_ptr(), sum_vec);
 
-                }
-                let mut arr = [0.0f32;8];
-                _mm256_storeu_ps(arr.as_mut_ptr(),sum_vec);
+        sum = arr.iter().sum();
 
-                sum = arr.iter().sum();
+        let x_rem = x_chunks.remainder();
+        let w_rem = w_chunks.remainder();
+        for i in 0..x_rem.len() {
+            let x_val = x_rem[i];
+            let w_val = bf16_u16_to_f32(w_rem[i]);
+            sum += x_val * w_val;
+        }
+    }
 
-                let x_rem = x_chunks.remainder();
-                let w_rem = w_chunks.remainder();
-                for i in 0..x_rem.len() {
-                    let x_val = x_rem[i];
-                    let w_val = bf16_u16_to_f32(w_rem[i]);
-                    sum += x_val * w_val;
-                }
-
-            }
-
-            sum
+    sum
 }
 
 pub fn silu(weight: &mut Tensor, up: &Tensor) {

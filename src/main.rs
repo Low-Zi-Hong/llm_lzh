@@ -19,8 +19,8 @@ use tensor::{Tensor, update_stride};
 
 mod llm;
 use llm::{
-    apply_rope, attention_score, attn_out, get_weight_matrix, get_weight_shape, linear_proj,
-    mlp_mul, out_proj, random, res_conn, rmsnorm, silu, softmax, token_embedding,
+    apply_rope, attention_score, attn_out, get_weight_matrix, linear_proj, mlp_mul, out_proj,
+    random, res_conn, rmsnorm, silu, softmax, token_embedding,
 };
 
 mod load;
@@ -40,7 +40,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[cfg(feature = "bench")]
 mod bench;
 #[cfg(feature = "bench")]
-use bench::{GlobalMonitor,FnIndex};
+use bench::{FnIndex, GlobalMonitor};
 
 fn main() {
     #[cfg(feature = "dhat_heap")]
@@ -70,25 +70,26 @@ fn main() {
     let mut monitor = GlobalMonitor::new();
 
     //path
-    let mut tokenizer = Tokenizer::new("./tokenizer.json");
-    let config_path: String = "./config.json".to_string();
-    let file_path = "./model.safetensors";
+    let mut tokenizer = Tokenizer::new("../model_qwen/tokenizer.json");
+    let config_path: String = "../model_qwen/config.json".to_string();
+    let file_path = "../model_qwen/model.safetensors";
     //./model_qwen
 
     //encoding
-    let raw_string = "<|im_start|>fuck you".to_string();
+    //let raw_string = "<|im_start|>fuck you".to_string();
     //let vec = tokenizer.encode(raw_string);
     //print!("{:?}",vec);
-    
 
     //raw token
     let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
 
     //tokenizer
-    let mut result_string:String = "".to_string();
+    let mut result_string: String = "".to_string();
 
     println!("Running llm with input token as: {:?}", raw_token);
-    raw_token.iter().for_each(|x| result_string.push_str(&tokenizer.decode(*x as u32)));
+    raw_token
+        .iter()
+        .for_each(|x| result_string.push_str(&tokenizer.decode(*x as u32)));
 
     //process token
     let mut whole_token_list: Vec<usize> = raw_token.clone();
@@ -490,7 +491,6 @@ fn main() {
             .collect();
         tuple.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-
         let mut cumulative_prob = 0.0;
         let mut id: usize = 0;
         while cumulative_prob < P {
@@ -554,13 +554,10 @@ fn main() {
         monitor.exit(FnIndex::TokenizerDecode);
         result_string.push_str(&result_str);
         println!("Result: {}", result_string);
-        
 
         if next_token_id == 151643 || next_token_id == 151645 {
             break;
         }
-
-
 
         #[cfg(feature = "dhat_heap")]
         if (current_pos >= 50) {
