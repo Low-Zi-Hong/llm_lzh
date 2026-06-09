@@ -82,18 +82,73 @@ pub fn rmsnorm(
     hidden_dim: usize,
     epsilon: f32,
 ) -> Result<Tensor, String> {
-    let result: Vec<f32> = input
-        .data
-        .chunks_exact(hidden_dim)
-        .flat_map(|chunk| {
-            let accumulator: f32 = chunk.iter().map(|x| x * x).sum();
-            let denominator = f32::sqrt((accumulator / hidden_dim as f32) + epsilon);
-            chunk
-                .iter()
-                .zip(weight.data.iter())
-                .map(move |(&x, &w)| (x / denominator) * bf16_u16_to_f32(w))
-        })
-        .collect();
+
+    let mut result = vec![0.0;input.data.len()];
+    let input_row = input.data.chunks_exact(hidden_dim);
+    let res_row = result.chunks_exact_mut(hidden_dim);
+
+    for (input, output) in input_row.zip(res_row) {
+        let mut accumulator :f32;
+        unsafe{
+            let mut acc_vec = _mm256_setzero_ps();
+            let mut data_chunks = input.chunks_exact(8);
+            for c_chunk in data_chunks.by_ref(){
+                let data_ptr = c_chunk.as_ptr();
+                let data_vec = _mm256_loadu_ps(data_ptr);
+                let data_vec_2 = _mm256_loadu_ps(data_ptr);
+                acc_vec = _mm256_fmadd_ps(data_vec, data_vec_2, acc_vec);
+            }
+            let low_128 = _mm256_castps256_ps128(acc_vec);
+            let high_128 = _mm256_extractf128_ps(acc_vec,1);
+
+            let mut sum_128 = _mm_add_ps(low_128, high_128);
+            let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b01_00_11_10);
+            sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+            let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b00_01_00_01);
+            sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+            accumulator = _mm_cvtss_f32(sum_128);
+
+            let data_rem  = data_chunks.remainder();
+            for data in 0..data_rem.len(){
+                let data = data_rem[data];
+                accumulator += data * data;
+            }
+
+            //denomitor
+            let inv_denominator = 1.0 / f32::sqrt((accumulator / hidden_dim as f32) + epsilon);
+            let invdenominator_vec =  _mm256_set1_ps(inv_denominator);
+
+            let mut x_chunks = input.chunks_exact(8);
+            let mut weight_chunks = weight.data.chunks_exact(8);
+            let mut out_chunks = output.chunks_exact_mut(8);
+
+            for ((x_chunk,w_chunk),out_chunk) in (x_chunks.by_ref().zip(weight_chunks.by_ref())).zip(out_chunks.by_ref()) {
+                let x_ptr = x_chunk.as_ptr();
+                let x_vec = _mm256_loadu_ps(x_ptr);
+
+                let w_ptr = w_chunk.as_ptr();
+                let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
+                let w_256_int = _mm256_cvtepu16_epi32(w_128);
+                let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
+                let w_vec = _mm256_castsi256_ps(w_256_shifted);
+
+                let mut res_vec =  _mm256_mul_ps(x_vec,invdenominator_vec);
+                res_vec = _mm256_mul_ps(w_vec, res_vec);
+
+                let out_ptr = out_chunk.as_mut_ptr();
+                _mm256_storeu_ps(out_ptr,res_vec);
+            }   
+            let x_rem = x_chunks.remainder();
+            let w_rem = weight_chunks.remainder();
+            let out_rem = out_chunks.into_remainder();
+            for i in 0..x_rem.len() 
+            {
+                out_rem[i] = (x_rem[i] * inv_denominator) * bf16_u16_to_f32(w_rem[i]);
+            }
+        }
+    }
 
     Ok(Tensor {
         data: result,
@@ -459,23 +514,31 @@ fn dot_avx2_bf16(x: &[f32], w: &[u16]) -> f32 {
             let w_ptr = w_chunk.as_ptr();
             let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
 
-            //here do prefetch
-            //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
-
-            //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
-
             let w_256_int = _mm256_cvtepu16_epi32(w_128);
 
             let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
 
             let w_vec = _mm256_castsi256_ps(w_256_shifted);
 
+            //here do prefetch
+            //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
+
+            //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
+
             sum_vec = _mm256_fmadd_ps(x_vec, w_vec, sum_vec);
         }
-        let mut arr = [0.0f32; 8];
-        _mm256_storeu_ps(arr.as_mut_ptr(), sum_vec);
 
-        sum = arr.iter().sum();
+        let low_128 = _mm256_castps256_ps128(sum_vec);
+        let high_128 = _mm256_extractf128_ps(sum_vec,1);
+
+        let mut sum_128 = _mm_add_ps(low_128, high_128);
+        let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b01_00_11_10);
+        sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+        let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b00_01_00_01);
+        sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+        sum = _mm_cvtss_f32(sum_128);
 
         let x_rem = x_chunks.remainder();
         let w_rem = w_chunks.remainder();

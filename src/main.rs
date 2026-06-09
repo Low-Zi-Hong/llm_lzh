@@ -70,9 +70,9 @@ fn main() {
     let mut monitor = GlobalMonitor::new();
 
     //path
-    let mut tokenizer = Tokenizer::new("../model_qwen/tokenizer.json");
-    let config_path: String = "../model_qwen/config.json".to_string();
-    let file_path = "../model_qwen/model.safetensors";
+    let mut tokenizer = Tokenizer::new("./tokenizer.json");
+    let config_path: String = "./config.json".to_string();
+    let file_path = "./model.safetensors";
     //./model_qwen
 
     //encoding
@@ -537,9 +537,11 @@ fn main() {
         //    .max_by(|a, b| a.1.partial_cmp(b.1).expect("cannot compare"))
         //    .expect("cannot compare");
         //
+        #[cfg(feature = "bench")]
         println!("next token is: {} score is {}", next_token_id, max_score);
         whole_token_list.push(next_token_id as usize);
 
+        #[cfg(feature = "bench")]
         println!("whole token list: {:?}", &whole_token_list);
 
         io::stdout().flush().unwrap();
