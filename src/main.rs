@@ -70,18 +70,28 @@ fn main() {
     let mut monitor = GlobalMonitor::new();
 
     //path
-    let mut tokenizer = Tokenizer::new("./tokenizer.json");
-    let config_path: String = "./config.json".to_string();
-    let file_path = "./model.safetensors";
+    let mut tokenizer = Tokenizer::new("../model_qwen/tokenizer.json");
+    let config_path: String = "../model_qwen/config.json".to_string();
+    let file_path = "../model_qwen/model.safetensors";
     //./model_qwen
-
-    //encoding
-    //let raw_string = "<|im_start|>fuck you".to_string();
-    //let vec = tokenizer.encode(raw_string);
-    //print!("{:?}",vec);
 
     //raw token
     let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
+
+    //encoding
+    let raw_system_input = "<|im_start|>system\n
+                You are a helpful AI assistant.<|im_end|>\n
+                <|im_start|>user\n"
+                .to_string();
+    let mut input = String::new();
+    println!("User: ");
+    io::stdout().flush().expect("cannot flush");
+    io::stdin().read_line(&mut input).expect("cannot read input");
+    let trimmed_input:String = format!("{}{}\n<|im_end|>\n<|im_start|>assistant\n",raw_system_input,input.trim().to_string(),);
+    let raw_token = tokenizer.encode(&trimmed_input.to_string());
+    //let vec = tokenizer.encode(raw_string);
+    //print!("{:?}",vec);
+
 
     //tokenizer
     let mut result_string: String = "".to_string();
@@ -224,6 +234,7 @@ fn main() {
     call_indicator!();
 
     //big loop :D
+    loop{
     loop {
         #[cfg(feature = "bench")]
         monitor.enter();
@@ -555,7 +566,8 @@ fn main() {
         #[cfg(feature = "bench")]
         monitor.exit(FnIndex::TokenizerDecode);
         result_string.push_str(&result_str);
-        println!("Result: {}", result_string);
+        //println!("Result: {}", result_string);
+        print!("{}",result_str);
 
         if next_token_id == 151643 || next_token_id == 151645 {
             break;
@@ -584,5 +596,15 @@ fn main() {
         monitor.reset();
     }
 
+    let init_input = "\n<|im_start|>user\n"
+                .to_string();
+    let mut input = String::new();
+    println!("User: ");
+    io::stdout().flush().expect("cannot flush");
+    io::stdin().read_line(&mut input).expect("cannot read input");
+    let mut trimmed_input:String = input.trim().to_string();
+    trimmed_input.push_str("<|im_end|>\n<|im_start|>assistant\n");
+    current_token = tokenizer.encode(&trimmed_input.to_string())
+    }
     //print!("{:?}", x);
 }
