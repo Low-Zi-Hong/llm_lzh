@@ -1,17 +1,35 @@
-use crate::load::convert_to_f32;
-use crate::tensor::{Tensor, update_stride};
+use crate::tensor::{Tensor, WeightTensor, bf16_u16_to_f32, bytes_to_u16_slice};
 use std::{time::UNIX_EPOCH, vec};
 
 use memmap::Mmap;
+use rayon::iter::ParallelIterator;
 use serde_json::Value;
 
-pub fn get_weight_matrix(
+use rayon::prelude::*;
+
+const RAYON_THRESHOLD: usize = 0;
+
+/*
+pub fn get_weight_shape(weight_name: &str, structure_json: &Value) -> Result<Vec<usize>, String> {
+    let value = structure_json[weight_name].clone();
+
+    let shape = value["shape"]
+        .as_array()
+        .expect("cannot extract token shape")
+        .iter()
+        .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
+        .collect();
+
+    Ok(shape)
+}*/
+
+pub fn get_weight_matrix<'a>(
     weight_name: &str,
     structure_json: &Value,
-    mmap: &Mmap,
+    mmap: &'a Mmap,
     header_size: usize,
-) -> Result<Tensor, String> {
-    let value = structure_json[weight_name].clone();
+) -> Result<WeightTensor<'a>, String> {
+    let value = &structure_json[weight_name];
     let offset: Vec<usize> = value["data_offsets"]
         .as_array()
         .expect("cannot extract token offset")
@@ -19,76 +37,118 @@ pub fn get_weight_matrix(
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
     //let dtype = value["dtype"].as_str().expect("cannot extract dtype.");
-    let shape: Vec<usize> = value["shape"]
+    let shape = value["shape"]
         .as_array()
         .expect("cannot extract token shape")
         .iter()
         .map(|x| x.as_u64().expect("cannot convert num to u64.") as usize)
         .collect();
 
-    let mut stride: Vec<usize> = shape
-        .iter()
-        .rev()
-        .scan(1, |state, &dim| {
-            let current_stride = *state;
-            *state *= dim;
-            Some(current_stride)
-        })
-        .collect();
-    stride.reverse();
-
     let result_raw = &mmap[8 + header_size as usize + offset[0] as usize
         ..8 + header_size as usize + offset[1] as usize];
 
-    let result = result_raw
-        .chunks_exact(2)
-        .map(|chunk| convert_to_f32([chunk[0], chunk[1]]).expect("cannot convert to f32."))
-        .collect();
+    let weight = WeightTensor::new(
+        bytes_to_u16_slice(result_raw).expect("cannot convert to &[f32]"),
+        shape,
+    );
 
-    Ok(Tensor {
-        data: result,
-        shape: shape,
-        strides: stride,
-    })
+    Ok(weight)
 }
 
-pub fn token_embedding(token_ids: &Vec<usize>, weight_tensor: &Tensor) -> Result<Tensor, String> {
+pub fn token_embedding(
+    token_ids: &Vec<usize>,
+    weight_tensor: &WeightTensor,
+    x: &mut Tensor,
+) -> Result<(), String> {
     let hidden_dim = weight_tensor.shape[1];
 
-    let result = token_ids
+    x.data = token_ids
         .iter()
         .flat_map(|&id| {
             weight_tensor.data[(id * hidden_dim)..((id + 1) * hidden_dim)]
                 .iter()
-                .copied()
+                .map(|x| bf16_u16_to_f32(*x))
         })
         .collect();
 
-    Ok(Tensor {
-        data: result,
-        shape: vec![token_ids.len(), hidden_dim],
-        strides: vec![1 * hidden_dim, 1],
-    })
+    x.update_shape(vec![token_ids.len(), hidden_dim]);
+
+    Ok(())
 }
 
 pub fn rmsnorm(
     input: &Tensor,
-    weight: &Tensor,
+    weight: &WeightTensor,
     hidden_dim: usize,
     epsilon: f32,
 ) -> Result<Tensor, String> {
-    let result: Vec<f32> = input
-        .data
-        .chunks_exact(hidden_dim)
-        .flat_map(|chunk| {
-            let accumulator: f32 = chunk.iter().map(|x| x * x).sum();
-            let denominator = f32::sqrt((accumulator / hidden_dim as f32) + epsilon);
-            chunk
-                .iter()
-                .zip(weight.data.iter())
-                .map(move |(&x, &w)| (x / denominator) * w)
-        })
-        .collect();
+
+    let mut result = vec![0.0;input.data.len()];
+    let input_row = input.data.chunks_exact(hidden_dim);
+    let res_row = result.chunks_exact_mut(hidden_dim);
+
+    for (input, output) in input_row.zip(res_row) {
+        let mut accumulator :f32;
+        unsafe{
+            let mut acc_vec = _mm256_setzero_ps();
+            let mut data_chunks = input.chunks_exact(8);
+            for c_chunk in data_chunks.by_ref(){
+                let data_ptr = c_chunk.as_ptr();
+                let data_vec = _mm256_loadu_ps(data_ptr);
+                let data_vec_2 = _mm256_loadu_ps(data_ptr);
+                acc_vec = _mm256_fmadd_ps(data_vec, data_vec_2, acc_vec);
+            }
+            let low_128 = _mm256_castps256_ps128(acc_vec);
+            let high_128 = _mm256_extractf128_ps(acc_vec,1);
+
+            let mut sum_128 = _mm_add_ps(low_128, high_128);
+            let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b01_00_11_10);
+            sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+            let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b00_01_00_01);
+            sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+            accumulator = _mm_cvtss_f32(sum_128);
+
+            let data_rem  = data_chunks.remainder();
+            for data in 0..data_rem.len(){
+                let data = data_rem[data];
+                accumulator += data * data;
+            }
+
+            //denomitor
+            let inv_denominator = 1.0 / f32::sqrt((accumulator / hidden_dim as f32) + epsilon);
+            let invdenominator_vec =  _mm256_set1_ps(inv_denominator);
+
+            let mut x_chunks = input.chunks_exact(8);
+            let mut weight_chunks = weight.data.chunks_exact(8);
+            let mut out_chunks = output.chunks_exact_mut(8);
+
+            for ((x_chunk,w_chunk),out_chunk) in (x_chunks.by_ref().zip(weight_chunks.by_ref())).zip(out_chunks.by_ref()) {
+                let x_ptr = x_chunk.as_ptr();
+                let x_vec = _mm256_loadu_ps(x_ptr);
+
+                let w_ptr = w_chunk.as_ptr();
+                let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
+                let w_256_int = _mm256_cvtepu16_epi32(w_128);
+                let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
+                let w_vec = _mm256_castsi256_ps(w_256_shifted);
+
+                let mut res_vec =  _mm256_mul_ps(x_vec,invdenominator_vec);
+                res_vec = _mm256_mul_ps(w_vec, res_vec);
+
+                let out_ptr = out_chunk.as_mut_ptr();
+                _mm256_storeu_ps(out_ptr,res_vec);
+            }   
+            let x_rem = x_chunks.remainder();
+            let w_rem = weight_chunks.remainder();
+            let out_rem = out_chunks.into_remainder();
+            for i in 0..x_rem.len() 
+            {
+                out_rem[i] = (x_rem[i] * inv_denominator) * bf16_u16_to_f32(w_rem[i]);
+            }
+        }
+    }
 
     Ok(Tensor {
         data: result,
@@ -97,28 +157,37 @@ pub fn rmsnorm(
     })
 }
 
-pub fn linear_proj(input: &Tensor, weight: &Tensor, bias: &Tensor, q: &mut Tensor) -> Result<(),String> {
+pub fn linear_proj(
+    input: &Tensor,
+    weight: &WeightTensor,
+    bias: &WeightTensor,
+    q: &mut Tensor,
+) -> Result<(), String> {
     let input_shape = input.shape.clone();
     let weight_shape = weight.shape.clone();
 
     //let mut result = vec![0.0; input_shape[0] * weight_shape[0]];
 
-    assert_eq!(input_shape[0] * weight_shape[0], q.shape.iter().product::<usize>());
+    assert!(input_shape[0] * weight_shape[0] <= q.data.len());
+    //q.shape = vec![input_shape[0],weight_shape[0]];
+    //q.strides = update_stride(&q.shape).expect("cannot update stride");
 
     // 3. Perform the triple loop matrix multiplication
     for i in 0..input_shape[0] {
         for j in 0..weight_shape[0] {
-            let mut sum = 0.0;
-            for k in 0..input_shape[1] {
-                // Flat index formulas for 2D array representation
-                let idx_input = i * input_shape[1] + k;
-                let idx_weight = j * weight_shape[1] + k;
+            let x_start = i * input_shape[1];
+            let x_end = (i + 1) * input_shape[1];
+            let w_start = j * weight_shape[1];
+            let w_end = (j + 1) * weight_shape[1];
 
-                sum += input.data[idx_input] * weight.data[idx_weight];
-            }
+            let x_slices = &input.data[x_start..x_end];
+            let w_slices = &weight.data[w_start..w_end];
+
+            let sum = dot_avx2_bf16(x_slices, w_slices);
+
             // Store the final dot product result
             let out_idx = i * q.strides[0] + j;
-            q.data[out_idx] = sum + bias.data[j];
+            q.data[out_idx] = sum + bf16_u16_to_f32(bias.data[j]);
         }
     }
 
@@ -152,15 +221,16 @@ pub fn apply_rope(tensor: &mut Tensor, rope_theta: f32, current_pos: usize) {
     }
 }
 
-pub fn attention_score(q: &Tensor, k: &Tensor, kv_group: usize, valid_kv_len: usize,current_pos:usize) -> Result<Tensor, String> {
-    let mut s: Tensor = Tensor {
-        data: vec![0.0; q.shape[1] * q.shape[0] * valid_kv_len],
-        shape: vec![q.shape[1], q.shape[0], valid_kv_len],
-        strides: vec![],
-    };
+pub fn attention_score(
+    q: &Tensor,
+    k: &Tensor,
+    kv_group: usize,
+    valid_kv_len: usize,
+    current_pos: usize,
+    s: &mut Tensor,
+) -> Result<(), String> {
+    s.update_shape(vec![q.shape[1], q.shape[0], valid_kv_len]);
 
-    //update stride
-    s.strides = update_stride(&s.shape).expect("cannot generate stride for S");
     //print!("S shape: {:?} S stride:  {:?} S data size: {:?}",&s.shape, &s.strides, &s.data.len());
     for h in 0..s.shape[0] {
         //iter through head
@@ -168,6 +238,7 @@ pub fn attention_score(q: &Tensor, k: &Tensor, kv_group: usize, valid_kv_len: us
             for pos_k in 0..s.shape[2] {
                 let idx = h * s.strides[0] + pos_q * s.strides[1] + pos_k * s.strides[2] as usize;
                 let abs_pos_q = pos_q + (current_pos - (q.shape[0] - 1));
+                s.data[idx] = 0.0;
                 if abs_pos_q >= pos_k {
                     //determine use which K head
                     let k_h = h / kv_group as usize;
@@ -194,7 +265,7 @@ pub fn attention_score(q: &Tensor, k: &Tensor, kv_group: usize, valid_kv_len: us
         }
     }
 
-    Ok(s)
+    Ok(())
 }
 
 pub fn softmax(t: &mut Tensor) {
@@ -234,18 +305,17 @@ pub fn softmax(t: &mut Tensor) {
     }
 }
 
-pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize) -> Result<Tensor, String> {
-    let mut o: Tensor = Tensor {
-        data: vec![],
-        shape: vec![s.shape[1], s.shape[0], v.shape[2]],
-        strides: vec![],
-    };
-    o.strides = update_stride(&o.shape).expect("cannot generate stride");
-    o.data = vec![0.0 as f32; o.shape[0] * o.shape[1] * o.shape[2]];
+pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize, attn: &mut Tensor) -> Result<(), String> {
+    attn.update_shape(vec![s.shape[1], s.shape[0], v.shape[2]]);
 
-    for pos_q in 0..o.shape[0] {
-        for h in 0..o.shape[1] {
-            for d in 0..o.shape[2] {
+    assert!(
+        attn.data.len() >= attn.shape.iter().product(),
+        "attn shape wrong"
+    );
+
+    for pos_q in 0..attn.shape[0] {
+        for h in 0..attn.shape[1] {
+            for d in 0..attn.shape[2] {
                 let mut sum = 0.0 as f32;
                 for pos_k in 0..s.shape[2] {
                     let idx_s = h * s.strides[0] + pos_q * s.strides[1] + pos_k * s.strides[2];
@@ -253,70 +323,273 @@ pub fn attn_out(s: &Tensor, v: &Tensor, kv_group: usize) -> Result<Tensor, Strin
                         pos_k * v.strides[0] + (h / kv_group) * v.strides[1] + d * v.strides[2];
                     sum += s.data[idx_s] * v.data[idx_v];
                 }
-                let idx = pos_q * o.strides[0] + h * o.strides[1] + d * o.strides[2];
-                o.data[idx] = sum;
+                let idx = pos_q * attn.strides[0] + h * attn.strides[1] + d * attn.strides[2];
+                attn.data[idx] = sum;
             }
         }
     }
 
-    Ok(o)
+    Ok(())
 }
 
-pub fn out_proj(attn: &Tensor, o: &Tensor) -> Result<Tensor, String> {
-    let mut atten_fn: Tensor = Tensor {
-        data: vec![],
-        shape: vec![attn.shape[0], attn.shape[1]],
-        strides: vec![],
-    };
-    atten_fn.strides = update_stride(&atten_fn.shape).expect("cannot get stride");
-    atten_fn.data = vec![0.0 as f32; atten_fn.shape[0] * atten_fn.shape[1]];
+pub fn out_proj(attn: &Tensor, o: &WeightTensor, atten_fn: &mut Tensor) -> Result<(), String> {
+    if attn.shape[0] >= RAYON_THRESHOLD {
+        let _ = out_proj_rayon(attn, o, atten_fn);
+    } else {
+        let _ = out_proj_single(attn, o, atten_fn);
+    }
+
+    Ok(())
+}
+
+pub fn out_proj_single(
+    attn: &Tensor,
+    o: &WeightTensor,
+    atten_fn: &mut Tensor,
+) -> Result<(), String> {
+    atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
+
+    assert!(
+        atten_fn.data.len() >= atten_fn.shape.iter().product(),
+        "attn shape wrong"
+    );
+    atten_fn.data.fill(0.0);
+
+    let o0 = o.strides[0];
+    let a0 = attn.strides[0];
+    let af0 = atten_fn.strides[0];
 
     for i in 0..attn.shape[0] {
-        for j in 0..o.shape[0] {
-            let mut sum = 0.0f32;
-            for k in 0..attn.shape[1] {
-                sum += attn.data[i * attn.strides[0] + k] * o.data[j * o.strides[0] + k];
+        let i_offset = i * a0;
+        let af_offset = i * af0;
+        for k in 0..attn.shape[1] {
+            let attn_val = attn.data[i_offset + k];
+            for j in 0..o.shape[0] {
+                atten_fn.data[af_offset + j] += attn_val * bf16_u16_to_f32(o.data[(j * o0) + k]);
             }
-            atten_fn.data[i * atten_fn.strides[0] + j] = sum;
         }
     }
 
-    Ok(atten_fn)
+    Ok(())
+}
+
+pub fn out_proj_rayon(
+    attn: &Tensor,
+    o: &WeightTensor,
+    atten_fn: &mut Tensor,
+) -> Result<(), String> {
+    atten_fn.update_shape(vec![attn.shape[0], attn.shape[1]]);
+
+    assert!(
+        atten_fn.data.len() >= atten_fn.shape.iter().product(),
+        "attn shape wrong"
+    );
+    atten_fn.data.fill(0.0);
+
+    let o0 = o.strides[0];
+    let a0 = attn.strides[0];
+
+    let o_rows = o.shape[0];
+    //let k_len = attn.shape[1];
+
+    let total = atten_fn.shape.iter().product();
+
+    atten_fn.data[..total]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(idx, out_val)| {
+            let i = idx / o_rows;
+            let k = idx % o_rows;
+
+            let x_row_offset = i * a0;
+            let w_row_offset = k * o0;
+
+            let x_slices = &attn.data[x_row_offset..x_row_offset + o.shape[1]];
+            let w_slices = &o.data[w_row_offset..w_row_offset + o.shape[1]];
+
+            *out_val = dot_avx2_bf16(x_slices, w_slices);
+        });
+
+    Ok(())
 }
 
 pub fn res_conn(x: &mut Tensor, attn_final: &Tensor) {
     //print!("{:?}",x.shape);
-    x.data
+    let valid_data: usize = x.shape.iter().product();
+    x.data[..valid_data]
         .iter_mut()
         .zip(attn_final.data.iter())
         .for_each(|(a, b)| *a += *b);
 }
 
-pub fn mlp_mul(x: &Tensor, weight: &Tensor) -> Result<Tensor, String> {
+pub fn mlp_mul(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
+    if x.shape[0] >= RAYON_THRESHOLD {
+        let _ = mlp_mul_rayon(x, weight, output);
+    } else {
+        let _ = mlp_mul_single(x, weight, output);
+    }
+
+    Ok(())
+}
+
+pub fn mlp_mul_single(
+    x: &Tensor,
+    weight: &WeightTensor,
+    output: &mut Tensor,
+) -> Result<(), String> {
     //print!("{:?} : {:?}", x.shape, weight.shape);
-    let mut output: Tensor = Tensor {
-        data: vec![],
-        shape: vec![x.shape[0], weight.shape[0]],
-        strides: vec![],
-    };
-    output.strides = update_stride(&output.shape).expect("cannot upoadte stride");
-    output.data = vec![0.0; output.shape[0] * output.shape[1]];
+    output.update_shape(vec![x.shape[0], weight.shape[0]]);
+    let s1 = x.strides[0];
+    let s2 = x.strides[1];
+    let w1 = weight.strides[0];
+    let w2 = weight.strides[1];
+    let o1 = output.strides[0];
+    let o2 = output.strides[1];
+    //let weight_rows = weight.shape[0];
+    let weight_col = weight.shape[1];
 
     for i in 0..x.shape[0] {
         for k in 0..weight.shape[0] {
-            let mut sum = 0.0;
-            for j in 0..x.shape[1] {
-                let x_val = x.data[i * x.strides[0] + j * x.strides[1]];
-                let w_val = weight.data[k * weight.strides[0] + j * weight.strides[1]];
+            let x_row_offset = i * s1;
+            let w_row_offset = k * w1;
 
-                sum += x_val * w_val;
-            }
-
-            output.data[i * output.strides[0] + k * output.strides[1]] = sum;
+            let x_slice = &x.data[x_row_offset..x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset..w_row_offset + weight_col * w2];
+            let sum = dot_avx2_bf16(x_slice, w_slice);
+            output.data[i * o1 + k * o2] = sum;
         }
     }
 
-    Ok(output)
+    Ok(())
+}
+
+use core::arch::x86_64::*;
+pub fn mlp_mul_rayon(x: &Tensor, weight: &WeightTensor, output: &mut Tensor) -> Result<(), String> {
+    //print!("{:?} : {:?}", x.shape, weight.shape);
+    output.update_shape(vec![x.shape[0], weight.shape[0]]);
+    let s1 = x.strides[0];
+    let s2 = x.strides[1];
+    let w1 = weight.strides[0];
+    let w2 = weight.strides[1];
+    let weight_rows = weight.shape[0];
+    let weight_col = weight.shape[1];
+
+    let total: usize = output.shape.iter().product();
+
+    output.data[..total]
+        .par_iter_mut()
+        .with_min_len(5)
+        .enumerate()
+        .for_each(|(idx, out_val)| {
+            let i = idx / weight_rows;
+            let k = idx % weight_rows;
+
+            let x_row_offset = i * s1;
+            let w_row_offset = k * w1;
+
+            let x_slice = &x.data[x_row_offset..x_row_offset + weight_col * s2];
+            let w_slice = &weight.data[w_row_offset..w_row_offset + weight_col * w2];
+
+            let sum = dot_avx2_bf16(x_slice, w_slice);
+
+            *out_val = sum;
+        });
+
+    Ok(())
+}
+
+pub fn dot_avx2_bf16(x: &[f32], w: &[u16]) -> f32 {
+    let mut sum;
+    //let prefetch_dis = 32;
+    unsafe {
+        let mut sum_vec = _mm256_setzero_ps();
+        let mut sum_vec_2 = _mm256_setzero_ps();
+        let mut sum_vec_3 = _mm256_setzero_ps();
+        let mut sum_vec_4 = _mm256_setzero_ps();
+
+        let mut x_chunks = x.chunks_exact(32);
+        let mut w_chunks = w.chunks_exact(32);
+
+        for (x_chunk, w_chunk) in x_chunks.by_ref().zip(w_chunks.by_ref()) {
+            let x_ptr = x_chunk.as_ptr();
+            let x_vec = _mm256_loadu_ps(x_ptr);
+
+            let x_ptr_2 = x_ptr.add(8);
+            let x_vec_2 = _mm256_loadu_ps(x_ptr_2);
+
+            let x_ptr_3 = x_ptr.add(16);
+            let x_vec_3 = _mm256_loadu_ps(x_ptr_3);
+
+            let x_ptr_4 = x_ptr.add(24);
+            let x_vec_4 = _mm256_loadu_ps(x_ptr_4);
+
+
+            let w_ptr = w_chunk.as_ptr();
+            let w_128 = _mm_loadu_si128(w_ptr as *const __m128i);
+            let w_256_int = _mm256_cvtepu16_epi32(w_128);
+
+            let w_ptr_2 = w_ptr.add(8);
+            let w_128_2 = _mm_loadu_si128(w_ptr_2 as *const __m128i);
+            let w_256_int_2 = _mm256_cvtepu16_epi32(w_128_2);
+
+            let w_ptr_3 = w_ptr.add(16);
+            let w_128_3 = _mm_loadu_si128(w_ptr_3 as *const __m128i);
+            let w_256_int_3 = _mm256_cvtepu16_epi32(w_128_3);
+
+            let w_ptr_4 = w_ptr.add(24);
+            let w_128_4 = _mm_loadu_si128(w_ptr_4 as *const __m128i);
+            let w_256_int_4 = _mm256_cvtepu16_epi32(w_128_4);
+
+            let w_256_shifted = _mm256_slli_epi32(w_256_int, 16);
+            let w_256_shifted_2 = _mm256_slli_epi32(w_256_int_2, 16);
+            let w_256_shifted_3 = _mm256_slli_epi32(w_256_int_3, 16);
+            let w_256_shifted_4 = _mm256_slli_epi32(w_256_int_4, 16);
+            
+            let w_vec = _mm256_castsi256_ps(w_256_shifted);
+            let w_vec_2 = _mm256_castsi256_ps(w_256_shifted_2);
+            let w_vec_3 = _mm256_castsi256_ps(w_256_shifted_3);
+            let w_vec_4 = _mm256_castsi256_ps(w_256_shifted_4);
+
+
+
+
+            //here do prefetch
+            //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);
+
+            //_mm_prefetch::<_MM_HINT_NTA>(w_ptr.add(prefetch_dis) as *const i8);
+
+            sum_vec = _mm256_fmadd_ps(x_vec, w_vec, sum_vec);
+            sum_vec_2 = _mm256_fmadd_ps(x_vec_2, w_vec_2, sum_vec_2);
+            sum_vec_3 = _mm256_fmadd_ps(x_vec_3, w_vec_3, sum_vec_3);
+            sum_vec_4 = _mm256_fmadd_ps(x_vec_4, w_vec_4, sum_vec_4);
+        }
+
+        sum_vec_3 = _mm256_add_ps(sum_vec_3, sum_vec_4);
+        sum_vec = _mm256_add_ps(sum_vec_2, sum_vec);
+        sum_vec = _mm256_add_ps(sum_vec_3, sum_vec);
+
+        let low_128 = _mm256_castps256_ps128(sum_vec);
+        let high_128 = _mm256_extractf128_ps(sum_vec,1);
+
+        let mut sum_128 = _mm_add_ps(low_128, high_128);
+        let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b01_00_11_10);
+        sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+        let shuf_128 = _mm_shuffle_ps(sum_128, sum_128, 0b00_01_00_01);
+        sum_128 = _mm_add_ps(sum_128,shuf_128);
+
+        sum = _mm_cvtss_f32(sum_128);
+
+        let x_rem = x_chunks.remainder();
+        let w_rem = w_chunks.remainder();
+        for i in 0..x_rem.len() {
+            let x_val = x_rem[i];
+            let w_val = bf16_u16_to_f32(w_rem[i]);
+            sum += x_val * w_val;
+        }
+    }
+
+    sum
 }
 
 pub fn silu(weight: &mut Tensor, up: &Tensor) {
@@ -348,6 +621,10 @@ mod tests {
     use crate::tensor::Tensor;
     use std::vec;
 
+    fn mock_f32_to_bf16(val: f32) -> u16 {
+        (val.to_bits() >> 16) as u16
+    }
+
     // 物理级探针：处理 f32 浮点数计算时的微小精度误差
     macro_rules! assert_f32_eq {
         ($a:expr, $b:expr) => {
@@ -363,13 +640,19 @@ mod tests {
     #[test]
     fn test_token_embedding() {
         let token_ids = vec![1]; // 选取词表第 2 个 token
-        let weight_tensor = Tensor {
-            data: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        let raw_f32 = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let w_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let weight_tensor = WeightTensor {
+            data: &w_data,
             shape: vec![2, 3], // 2个token，hidden_dim=3
             strides: vec![3, 1],
         };
 
-        let out = token_embedding(&token_ids, &weight_tensor).expect("embedding 提取崩溃");
+        let mut out = Tensor::new(vec![0.0; 2 * 3], vec![0]);
+        token_embedding(&token_ids, &weight_tensor, &mut out).expect("embedding 提取崩溃");
         assert_eq!(out.shape, vec![1, 3]);
         assert_f32_eq!(out.data[0], 0.4);
         assert_f32_eq!(out.data[1], 0.5);
@@ -383,8 +666,13 @@ mod tests {
             shape: vec![2],
             strides: vec![1],
         };
-        let weight = Tensor {
-            data: vec![1.0, 2.0],
+        let raw_f32 = vec![1.0, 2.0];
+        let w_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let weight = WeightTensor {
+            data: &w_data,
             shape: vec![2],
             strides: vec![1],
         };
@@ -403,19 +691,31 @@ mod tests {
             shape: vec![1, 2],
             strides: vec![2, 1],
         };
-        let w = Tensor {
-            data: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], // [3, 2]
+        let raw_f32 = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let w_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let w = WeightTensor {
+            data: &w_data,
             shape: vec![3, 2],
             strides: vec![2, 1],
         };
-        let b = Tensor {
-            data: vec![0.1, 0.1, 0.1], // bias
+        let raw_f32 = vec![0.1, 0.1, 0.1];
+        let b_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let b = WeightTensor {
+            data: &b_data, // bias
             shape: vec![3],
             strides: vec![1],
         };
 
-        let out = linear_proj(&x, &w, &b).expect("linear_proj 计算图崩溃");
-        assert_eq!(out.shape, vec![1, 3]);
+        let mut out = Tensor::new(vec![0.0; 3], vec![0]);
+
+        linear_proj(&x, &w, &b, &mut out).expect("linear_proj 计算图崩溃");
+        //assert_eq!(out.shape, vec![1, 3]);
         // out[0] = 1*0.1 + 2*0.2 + 0.1 = 0.6
         // out[1] = 1*0.3 + 2*0.4 + 0.1 = 1.2
         assert_f32_eq!(out.data[0], 0.6);
@@ -430,7 +730,7 @@ mod tests {
             strides: vec![2, 2, 1],
         };
         // 若 pos=0，theta=0，cos=1, sin=0 -> 数据不变
-        apply_rope(&mut t, 10000.0);
+        apply_rope(&mut t, 10000.0, 0);
         assert_f32_eq!(t.data[0], 1.0);
         assert_f32_eq!(t.data[1], 1.0);
     }
@@ -448,8 +748,10 @@ mod tests {
             strides: vec![2, 2, 1],
         };
 
+        let mut out = Tensor::new(vec![0.0; 100], vec![0]);
+
         // 注意：内部会调用 update_stride(&s.shape)，假设其工作正常
-        let out = attention_score(&q, &k, 1).unwrap();
+        attention_score(&q, &k, 1, 1, 0, &mut out).unwrap();
         // dot product = 2.0 + 6.0 = 8.0
         // sum *= 1.0 / sqrt(2) ≈ 5.65685
         assert_f32_eq!(out.data[0], 5.65685);
@@ -483,7 +785,8 @@ mod tests {
         };
         // out[d=0] = 0.5*1.0 + 0.5*3.0 = 2.0
         // out[d=1] = 0.5*2.0 + 0.5*4.0 = 3.0
-        let out = attn_out(&s, &v, 1).unwrap();
+        let mut out = Tensor::new(vec![0.0; 100], vec![0]);
+        attn_out(&s, &v, 1, &mut out).unwrap();
         assert_f32_eq!(out.data[0], 2.0);
         assert_f32_eq!(out.data[1], 3.0);
     }
@@ -504,19 +807,25 @@ mod tests {
 
         // 3. 构建 o_proj 权重张量 [out_dim, hidden_dim]
         // 假设我们要把它投射回一个 dim=2 的空间，所以 shape 是 [2, 4]
-        let o_proj = Tensor {
-            data: vec![
-                0.1, 0.2, 0.3, 0.4, // 对应第 1 个输出特征
-                0.5, 0.6, 0.7, 0.8, // 对应第 2 个输出特征
-                0.1, 0.2, 0.3, 0.4, // 对应第 3 个输出特征
-                0.5, 0.6, 0.7, 0.8, // 对应第 4 个输出特征
-            ],
+        let raw_f32 = vec![
+            0.1, 0.2, 0.3, 0.4, // 对应第 1 个输出特征
+            0.5, 0.6, 0.7, 0.8, // 对应第 2 个输出特征
+            0.1, 0.2, 0.3, 0.4, // 对应第 3 个输出特征
+            0.5, 0.6, 0.7, 0.8, // 对应第 4 个输出特征
+        ];
+        let o_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let o_proj = WeightTensor {
+            data: &o_data,
             shape: vec![4, 4],
             strides: vec![4, 1], // 2D 步长
         };
 
         // 4. 送入你的原始 out_proj
-        let out = out_proj(&attn, &o_proj).expect("out_proj 计算图崩溃");
+        let mut out = Tensor::new(vec![0.0; 100], vec![0]);
+        out_proj(&attn, &o_proj, &mut out).expect("out_proj 计算图崩溃");
 
         // 5. 物理期望校验
         // out[0] = 1*0.1 + 2*0.2 + 3*0.3 + 4*0.4 = 0.1 + 0.4 + 0.9 + 1.6 = 3.0
@@ -550,14 +859,20 @@ mod tests {
             shape: vec![1, 2],
             strides: vec![2, 1],
         };
-        let w = Tensor {
-            data: vec![2.0, 3.0, 4.0, 5.0], // shape [2, 2]
+        let raw_f32 = vec![2.0, 3.0, 4.0, 5.0];
+        let w_data = raw_f32
+            .iter()
+            .map(|&x| mock_f32_to_bf16(x))
+            .collect::<Vec<u16>>();
+        let w = WeightTensor {
+            data: &w_data, // shape [2, 2]
             shape: vec![2, 2],
             strides: vec![2, 1],
         };
+        let mut out = Tensor::new(vec![0.0; 10000], vec![0]);
         // out[0,0] = x[0,0]*w[0,0] + x[0,1]*w[0,1] = 1*2 + 2*3 = 8.0
         // out[0,1] = x[0,0]*w[1,0] + x[0,1]*w[1,1] = 1*4 + 2*5 = 14.0
-        let out = mlp_mul(&x, &w).unwrap();
+        mlp_mul(&x, &w, &mut out).unwrap();
         assert_f32_eq!(out.data[0], 8.0);
         assert_f32_eq!(out.data[1], 14.0);
     }

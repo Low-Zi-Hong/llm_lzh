@@ -1,6 +1,12 @@
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct Tensor {
     pub data: Vec<f32>,
+    pub shape: Vec<usize>,
+    pub strides: Vec<usize>,
+}
+
+pub struct WeightTensor<'a> {
+    pub data: &'a [u16],
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
 }
@@ -15,11 +21,36 @@ impl Tensor {
         }
     }
 
-    pub fn update_shape(&mut self, shape:Vec<usize>) {
+    pub fn update_shape(&mut self, shape: Vec<usize>) {
         self.strides = update_stride(&shape).expect("cannot create stride");
         self.shape = shape;
-
     }
+}
+
+impl<'a> WeightTensor<'a> {
+    pub fn new(data: &'a [u16], shape: Vec<usize>) -> Self {
+        let strides = update_stride(&shape).expect("cannot create stride");
+        Self {
+            data,
+            shape,
+            strides,
+        }
+    }
+}
+
+pub fn bytes_to_u16_slice<'a>(bytes: &'a [u8]) -> Result<&'a [u16], String> {
+    unsafe {
+        assert!(bytes.len() % 2 == 0, "bytes len must be factor of 4");
+        let ptr = bytes.as_ptr() as *const u16;
+        let len = bytes.len() / 2;
+        Ok(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+#[inline(always)]
+pub fn bf16_u16_to_f32(b16: u16) -> f32 {
+    let f32_bits = (b16 as u32) << 16;
+    f32::from_bits(f32_bits)
 }
 
 pub fn update_stride(shape: &Vec<usize>) -> Result<Vec<usize>, String> {
