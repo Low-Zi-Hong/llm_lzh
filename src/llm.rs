@@ -544,14 +544,11 @@ pub fn dot_avx2_bf16(x: &[f32], w: &[u16]) -> f32 {
             let w_256_shifted_2 = _mm256_slli_epi32(w_256_int_2, 16);
             let w_256_shifted_3 = _mm256_slli_epi32(w_256_int_3, 16);
             let w_256_shifted_4 = _mm256_slli_epi32(w_256_int_4, 16);
-            
+
             let w_vec = _mm256_castsi256_ps(w_256_shifted);
             let w_vec_2 = _mm256_castsi256_ps(w_256_shifted_2);
             let w_vec_3 = _mm256_castsi256_ps(w_256_shifted_3);
             let w_vec_4 = _mm256_castsi256_ps(w_256_shifted_4);
-
-
-
 
             //here do prefetch
             //_mm_prefetch::<_MM_HINT_T0>(x_ptr.add(prefetch_dis) as *const i8);

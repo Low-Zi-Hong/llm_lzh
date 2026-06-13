@@ -4,14 +4,15 @@ use std::io::{self, Write};
 use std::{
     fs::{self, File},
     vec,
+    path::Path,
 }; // Built into Rust, no extra crates needed
 
 //for benchmark use
 #[cfg(feature = "bench")]
 use std::time::Instant;
 
-const TEMPERATURE: f32 = 0.7;
-const P: f32 = 0.9;
+const TEMPERATURE: f32 = 0.6;
+const P: f32 = 0.8;
 const MAX_SEQ_LEN: usize = 2048;
 
 mod tensor;
@@ -29,6 +30,9 @@ use load::raw_to_json;
 mod tokenizer;
 use tokenizer::Tokenizer;
 
+mod quantize;
+use quantize::generate_q8_file;
+
 //dhat :D
 #[cfg(feature = "dhat_heap")]
 use dhat;
@@ -42,6 +46,7 @@ mod bench;
 #[cfg(feature = "bench")]
 use bench::{FnIndex, GlobalMonitor};
 
+pub const USE_Q8: bool = true;
 fn main() {
     #[cfg(feature = "dhat_heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -70,27 +75,36 @@ fn main() {
     let mut monitor = GlobalMonitor::new();
 
     //path
-    let mut tokenizer = Tokenizer::new("../model_qwen/tokenizer.json");
-    let config_path: String = "../model_qwen/config.json".to_string();
-    let file_path = "../model_qwen/model.safetensors";
+    let mut tokenizer = Tokenizer::new("./tokenizer.json");
+    let config_path: String = "./config.json".to_string();
+    let file_path = "./model.safetensors";
+    let q8_file_path = "./model.q8.safetensors";
+
+    if !Path::new(q8_file_path).exists() {
+        let _ = generate_q8_file(file_path);
+    }
+
     //./model_qwen
 
     //raw token
-    let raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
+    let mut raw_token = vec![104022, 393, 284, 43240, 549, 18137, 99, 244, 60726];
 
     //encoding
-    let raw_system_input = "<|im_start|>system\n
-                You are a helpful AI assistant.<|im_end|>\n
-                <|im_start|>user\n"
-                .to_string();
-    let mut input = String::new();
-    println!("User: ");
-    io::stdout().flush().expect("cannot flush");
-    io::stdin().read_line(&mut input).expect("cannot read input");
-    let trimmed_input:String = format!("{}{}\n<|im_end|>\n<|im_start|>assistant\n",raw_system_input,input.trim().to_string(),);
-    let raw_token = tokenizer.encode(&trimmed_input.to_string());
-    //let vec = tokenizer.encode(raw_string);
-    //print!("{:?}",vec);
+    #[cfg(not(feature = "bench"))]
+    {
+        let raw_system_input = "<|im_start|>system\n
+                    You are a helpful AI assistant.<|im_end|>\n
+                    <|im_start|>user\n"
+                    .to_string();
+        let mut input = String::new();
+        print!("\nUser: ");
+        io::stdout().flush().expect("cannot flush");
+        io::stdin().read_line(&mut input).expect("cannot read input");
+        let trimmed_input:String = format!("{}{}\n<|im_end|>\n<|im_start|>assistant\n",raw_system_input,input.trim().to_string(),);
+        raw_token = tokenizer.encode(&trimmed_input.to_string());
+        //let vec = tokenizer.encode(raw_string);
+        //print!("{:?}",vec);
+    }
 
 
     //tokenizer
@@ -112,7 +126,7 @@ fn main() {
     let config: Value = serde_json::from_str(&config_raw).expect("cannot parse config file");
 
     //open the file and use mmap to map to memory
-    let file = File::open(file_path).unwrap();
+    let file = if USE_Q8 { File::open(q8_file_path).unwrap()} else { File::open(file_path).unwrap()};
     let mmap = unsafe { Mmap::map(&file).unwrap() };
 
     //print!("{:?}",(&mmap[0..8]));
@@ -121,7 +135,8 @@ fn main() {
     let mut n_raw = [0u8; 8];
     n_raw.copy_from_slice(&mmap[0..8]);
     let header_size: usize = u64::from_le_bytes(n_raw) as usize;
-    //print!("{:?}",n);
+    print!("header size: {:?}",header_size);
+    io::stdout().flush().expect("cannot flush");
 
     //get the chunk of bit which represent the json and convert it to json value
     let json_raw = &mmap[8..8 + header_size];
@@ -595,16 +610,15 @@ fn main() {
         #[cfg(feature = "bench")]
         monitor.reset();
     }
-
-    let init_input = "\n<|im_start|>user\n"
-                .to_string();
-    let mut input = String::new();
-    println!("User: ");
-    io::stdout().flush().expect("cannot flush");
-    io::stdin().read_line(&mut input).expect("cannot read input");
-    let mut trimmed_input:String = input.trim().to_string();
-    trimmed_input.push_str("<|im_end|>\n<|im_start|>assistant\n");
-    current_token = tokenizer.encode(&trimmed_input.to_string())
+        #[cfg(not(feature = "bench"))]
+    {
+        let mut input = String::new();
+        print!("\nUser: ");
+        io::stdout().flush().expect("cannot flush");
+        io::stdin().read_line(&mut input).expect("cannot read input");
+        let trimmed_input:String = format!("\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", input.trim().to_string());
+        current_token = tokenizer.encode(&trimmed_input.to_string())
+    }
     }
     //print!("{:?}", x);
 }

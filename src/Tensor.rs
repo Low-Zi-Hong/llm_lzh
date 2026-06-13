@@ -5,10 +5,22 @@ pub struct Tensor {
     pub strides: Vec<usize>,
 }
 
+pub enum WeightData<'a> {
+    BF16(&'a [u16]),
+    Q8(&'a [BlockQ8_0]),
+}
+
 pub struct WeightTensor<'a> {
-    pub data: &'a [u16],
+    pub data: WeightData<'a>,
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
+}
+
+#[repr(C)]
+#[derive(Clone,Copy,Debug)]
+pub struct BlockQ8_0 {
+    pub d : f32,
+    pub qs: [i8;32],
 }
 
 impl Tensor {
@@ -28,12 +40,12 @@ impl Tensor {
 }
 
 impl<'a> WeightTensor<'a> {
-    pub fn new(data: &'a [u16], shape: Vec<usize>) -> Self {
+    pub fn new(data:WeightData<'a>, shape: Vec<usize>) -> Self {
         let strides = update_stride(&shape).expect("cannot create stride");
-        Self {
+        Self{
             data,
             shape,
-            strides,
+            strides
         }
     }
 }
