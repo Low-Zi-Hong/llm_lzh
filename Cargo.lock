@@ -336,6 +336,7 @@ dependencies = [
  "dhat",
  "memmap",
  "rayon",
+ "serde",
  "serde_json",
 ]
 

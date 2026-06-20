@@ -9,6 +9,7 @@ memmap = "0.7.0"
 serde_json = "1.0.150"
 dhat = "0.3"
 rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [profile.release]
 debug = 1

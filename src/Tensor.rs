@@ -5,10 +5,24 @@ pub struct Tensor {
     pub strides: Vec<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub enum WeightData<'a> {
+    F32(&'a [f32]),
+    BF16(&'a [u16]),
+    Q8(&'a [BlockQ8_0]),
+}
+
 pub struct WeightTensor<'a> {
-    pub data: &'a [u16],
+    pub data: WeightData<'a>,
     pub shape: Vec<usize>,
     pub strides: Vec<usize>,
+}
+
+#[repr(C)]
+#[derive(Clone,Copy,Debug)]
+pub struct BlockQ8_0 {
+    pub d : f32,
+    pub qs: [i8;32],
 }
 
 impl Tensor {
@@ -28,21 +42,45 @@ impl Tensor {
 }
 
 impl<'a> WeightTensor<'a> {
-    pub fn new(data: &'a [u16], shape: Vec<usize>) -> Self {
+    pub fn new(data:WeightData<'a>, shape: Vec<usize>) -> Self {
         let strides = update_stride(&shape).expect("cannot create stride");
-        Self {
+        Self{
             data,
             shape,
-            strides,
+            strides
         }
     }
 }
 
 pub fn bytes_to_u16_slice<'a>(bytes: &'a [u8]) -> Result<&'a [u16], String> {
     unsafe {
-        assert!(bytes.len() % 2 == 0, "bytes len must be factor of 4");
+        assert!(bytes.len() % 2 == 0, "bytes len m ust be factor of 4");
         let ptr = bytes.as_ptr() as *const u16;
         let len = bytes.len() / 2;
+        Ok(std::slice::from_raw_parts(ptr, len))
+    }
+}
+
+pub fn bytes_to_f32_slice<'a>(bytes: &'a [u8]) -> Result<&'a [f32], String> {
+    assert!(bytes.len() % 4 == 0, "bytes len m ust be factor of 4");
+    let ptr = bytes.as_ptr();
+    if ptr.align_offset(std::mem::align_of::<f32>()) != 0 {
+        return Err("f32 not align".to_string())
+    }
+    
+    unsafe {
+        let f32_ptr = ptr as *const f32;
+        let len = bytes.len() / 4;
+        Ok(std::slice::from_raw_parts(f32_ptr,len))
+    }
+}
+
+pub fn bytes_to_q8_slice<'a>(bytes: &'a [u8]) -> Result<&'a [BlockQ8_0], String> {
+    unsafe {
+        let block_bytes = size_of::<BlockQ8_0>();
+        assert!(bytes.len() % block_bytes == 0, "bytes cannot align");
+        let len = bytes.len() / block_bytes;
+        let ptr = bytes.as_ptr() as *const BlockQ8_0;
         Ok(std::slice::from_raw_parts(ptr, len))
     }
 }
