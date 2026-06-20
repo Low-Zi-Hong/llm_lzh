@@ -60,13 +60,23 @@ pub fn generate_q8_file(file_path : &str)
         new_dict.insert(tensor_name.clone(), info);
     }
 
-    let new_json = serde_json::to_string(&new_dict).expect("cannot convert to string");
+    let mut new_json = serde_json::to_string(&new_dict).expect("cannot convert to string");
     let new_json_byte = new_json.as_bytes();
 
     let mut out_file = File::create("model.q8.safetensors").expect("cannot create file");
     //out_file.write_all(b"Q8_0").expect("cannot write q8_0");
     
-    let new_header_size = new_json_byte.len() as u64;
+    let mut new_header_size = new_json_byte.len() as u64;
+    let remainder:usize = new_header_size as usize % 64;
+    if remainder != 0 {
+        let filling:usize = 64 - remainder;
+        new_json.push_str(&" ".repeat(filling));
+    }
+
+    let new_json_byte = new_json.as_bytes();
+    new_header_size = new_json_byte.len() as u64;
+
+
     let size_bytes = new_header_size.to_le_bytes();
     print!("{}",new_header_size);
     out_file.write_all(&size_bytes).expect("cannot write header_size");

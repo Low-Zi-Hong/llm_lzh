@@ -249,7 +249,7 @@ fn main() {
     call_indicator!();
 
     //big loop :D
-    loop{
+    'outer: loop{
     loop {
         #[cfg(feature = "bench")]
         monitor.enter();
@@ -589,8 +589,8 @@ fn main() {
         }
 
         #[cfg(feature = "dhat_heap")]
-        if (current_pos >= 50) {
-            break;
+        if (current_pos >= 20) {
+            break 'outer;
         }
 
         //bench
